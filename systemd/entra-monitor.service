@@ -1,0 +1,9 @@
+[Unit]
+Description=Microsoft Entra Monitoring Script
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/rrussell/scripts/entra_monitoring_project
+ExecStart=/home/rrussell/scripts/entra_monitoring_project/.venv/bin/python3 /home/rrussell/scripts/entra_monitoring_project/src/main.py

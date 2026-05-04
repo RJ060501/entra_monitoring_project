@@ -46,3 +46,9 @@ Thumbs.db
 *.tmp
 *.bak
 *.old
+
+# =========================
+# SRC FOLDERS
+# =========================
+state/
+logs/

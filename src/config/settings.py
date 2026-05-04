@@ -22,20 +22,18 @@ SUPPRESSED_USERS = [
 ]
 
 
-def load_dotenv(dotenv_path=".env"):
-    """Read a simple .env file and add values to os.environ."""
-    env_file = Path(dotenv_path)
+def load_dotenv():
+    project_root = Path(__file__).resolve().parents[2]
+    env_file = project_root / ".env"
 
     if not env_file.exists():
+        print(f"No .env file found at: {env_file}")
         return
 
     for raw_line in env_file.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
 
-        if not line or line.startswith("#"):
-            continue
-
-        if "=" not in line:
+        if not line or line.startswith("#") or "=" not in line:
             continue
 
         key, value = line.split("=", 1)
@@ -45,11 +43,12 @@ def load_dotenv(dotenv_path=".env"):
         if key and key not in os.environ:
             os.environ[key] = value
 
-
 def load_settings():
-    """Load runtime settings for the monitor."""
     load_dotenv()
 
     return {
-        "teams_webhook_url": os.getenv("TEAMS_WEBHOOK_URL", ""),
+        "teams_webhook_url": os.getenv("TEAMS_WEBHOOK_URL", "").strip(),
+        "tenant_id": os.getenv("TENANT_ID", "").strip(),
+        "client_id": os.getenv("CLIENT_ID", "").strip(),
+        "client_secret": os.getenv("CLIENT_SECRET", "").strip(),
     }
