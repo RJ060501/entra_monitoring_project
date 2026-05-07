@@ -33,6 +33,8 @@ from notifiers.console_notifier import send_alerts as send_console_alerts
 from notifiers.teams_notifier import send_alerts as send_teams_alerts
 from config.settings import load_settings
 from core.logger import setup_logger
+from clients.m365_audit_client import M365AuditClient
+from detectors.email_detector import detect_email_events
 
 
 def main():
@@ -43,9 +45,11 @@ def main():
     state = load_state()
 
     client = EntraClient(settings)
+    m365_client = M365AuditClient(settings)
 
     signins = client.get_signins()
     audits = client.get_audits()
+    email_events = m365_client.get_email_audit_events()
 
     new_signins = filter_new_events(
         signins,
@@ -56,6 +60,11 @@ def main():
         audits,
         state.get("processed_audit_ids", []),
     )
+    
+    new_email_events = filter_new_events(
+    email_events,
+    state.get("processed_email_event_ids", []),
+)
 
     print(f"New sign-in event(s): {len(new_signins)}")
     print(f"New audit event(s): {len(new_audits)}")
@@ -63,6 +72,7 @@ def main():
     alerts = []
     alerts += detect_signin_events(new_signins)
     alerts += detect_audit_events(new_audits)
+    alerts += detect_email_events(new_email_events)
 
     alerts = deduplicate_alerts(alerts)
 
@@ -80,6 +90,12 @@ def main():
         "processed_audit_ids",
         new_audits,
     )
+    
+    state = mark_events_processed(
+    state,
+    "processed_email_event_ids",
+    new_email_events,
+)
 
     save_state(state)
 

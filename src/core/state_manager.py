@@ -27,6 +27,7 @@ def load_state():
         return {
             "processed_signin_ids": [],
             "processed_audit_ids": [],
+            "processed_email_event_ids": [],
         }
 
     with STATE_FILE.open("r", encoding="utf-8") as file:
