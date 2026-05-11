@@ -68,6 +68,8 @@ def main():
 
     print(f"New sign-in event(s): {len(new_signins)}")
     print(f"New audit event(s): {len(new_audits)}")
+    print(f"New email audit event(s): {len(new_email_events)}")
+    logger.info(f"New email audit event(s): {len(new_email_events)}")
 
     alerts = []
     alerts += detect_signin_events(new_signins)

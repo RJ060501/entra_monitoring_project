@@ -51,4 +51,20 @@ def load_settings():
         "tenant_id": os.getenv("TENANT_ID", "").strip(),
         "client_id": os.getenv("CLIENT_ID", "").strip(),
         "client_secret": os.getenv("CLIENT_SECRET", "").strip(),
+        
+        # Microsoft 365 Management Activity API
+        "m365_tenant_id": os.getenv(
+            "M365_TENANT_ID",
+            os.getenv("TENANT_ID", "")
+        ).strip(),
+
+        "m365_client_id": os.getenv(
+            "M365_CLIENT_ID",
+            os.getenv("CLIENT_ID", "")
+        ).strip(),
+
+        "m365_client_secret": os.getenv(
+            "M365_CLIENT_SECRET",
+            os.getenv("CLIENT_SECRET", "")
+        ).strip(),
     }
