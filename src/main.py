@@ -35,6 +35,7 @@ from config.settings import load_settings
 from core.logger import setup_logger
 from clients.m365_audit_client import M365AuditClient
 from detectors.email_detector import detect_email_events
+from detectors.correlation_detector import detect_correlations
 
 
 def main():
@@ -75,6 +76,7 @@ def main():
     alerts += detect_signin_events(new_signins)
     alerts += detect_audit_events(new_audits)
     alerts += detect_email_events(new_email_events)
+    alerts += detect_correlations(new_signins, new_email_events)
 
     alerts = deduplicate_alerts(alerts)
 

@@ -92,6 +92,13 @@ def is_suspicious_signin(event):
     # Successful sign-ins before 6 AM or after 10 PM are also suspicious.
     if status == "success" and hour is not None and (hour < 6 or hour > 22):
         return True
+    
+    if risk_level in {"medium", "high"}:
+        return True
+
+    # Conditional Access failure is suspicious context.
+    if conditional_access_status == "failure":
+        return True
 
     return False
 
