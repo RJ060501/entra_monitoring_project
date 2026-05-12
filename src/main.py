@@ -36,6 +36,9 @@ from core.logger import setup_logger
 from clients.m365_audit_client import M365AuditClient
 from detectors.email_detector import detect_email_events
 from detectors.correlation_detector import detect_correlations
+from collections import Counter
+
+
 
 
 def main():
@@ -63,9 +66,18 @@ def main():
     )
     
     new_email_events = filter_new_events(
-    email_events,
-    state.get("processed_email_event_ids", []),
-)
+        email_events,
+        state.get("processed_email_event_ids", []),
+    )
+    
+    operation_counts = Counter(
+        event.get("operation", "Unknown")
+        for event in new_email_events
+    )
+
+    print("Top email audit operations:")
+    for operation, count in operation_counts.most_common(15):
+        print(f"{operation}: {count}")
 
     print(f"New sign-in event(s): {len(new_signins)}")
     print(f"New audit event(s): {len(new_audits)}")
