@@ -17,7 +17,16 @@ from azure.identity import ClientSecretCredential
 
 
 class M365AuditClient:
+    """
+    Client for talking to the Office 365 Management Activity API.
+
+    This client authenticates using app-only Azure credentials and retrieves
+    Exchange audit data in the form of content blob URLs. It also normalizes
+    raw audit records into simpler dictionaries used by the rest of the app.
+    """
+
     def __init__(self, settings):
+        # Store configuration settings and validate required M365 secrets.
         self.settings = settings
 
         self.tenant_id = settings["m365_tenant_id"]
@@ -29,6 +38,7 @@ class M365AuditClient:
                 "Missing M365_TENANT_ID, M365_CLIENT_ID, or M365_CLIENT_SECRET."
             )
 
+        # Create Azure credentials for app-only authentication.
         self.credential = ClientSecretCredential(
             tenant_id=self.tenant_id,
             client_id=self.client_id,
@@ -41,20 +51,24 @@ class M365AuditClient:
         )
 
     def _get_access_token(self):
+        # Acquire a bearer token for the Office 365 Management Activity API.
         token = self.credential.get_token(self.scope)
         return token.token
 
     def _get_headers(self):
+        # Return the standard headers for all API requests.
         return {
             "Authorization": f"Bearer {self._get_access_token()}",
             "Content-Type": "application/json",
         }
 
     def _iso_utc_minutes_ago(self, minutes):
+        # Convert a lookback interval into an ISO-formatted UTC timestamp.
         dt = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _raise_for_api_error(self, response):
+        # Print diagnostics and raise any HTTP error returned by the API.
         if response.status_code >= 400:
             print("Microsoft 365 Management Activity API request failed.")
             print(f"Status code: {response.status_code}")
@@ -66,7 +80,9 @@ class M365AuditClient:
         """
         Start the Exchange audit subscription.
 
-        Usually only needs to be done once.
+        The Office 365 Management Activity API requires a subscription to begin
+        publishing Exchange audit content. This method sends the start request
+        and returns True when the subscription is active.
         """
         url = f"{self.base_url}/subscriptions/start?contentType=Audit.Exchange"
 
@@ -82,6 +98,9 @@ class M365AuditClient:
     def list_exchange_content(self, lookback_minutes=60):
         """
         List available Exchange audit content blobs.
+
+        The API returns a list of content URIs for the requested time range.
+        These blobs must be downloaded separately to retrieve actual audit records.
         """
         start_time = self._iso_utc_minutes_ago(lookback_minutes)
         end_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -103,6 +122,9 @@ class M365AuditClient:
     def download_content_blob(self, content_uri):
         """
         Download one audit content blob.
+
+        Each content URI points to a JSON payload containing one or more audit
+        records for a time slice. The raw JSON is returned for later parsing.
         """
         response = requests.get(content_uri, headers=self._get_headers(), timeout=30)
         self._raise_for_api_error(response)
@@ -112,6 +134,10 @@ class M365AuditClient:
     def get_email_audit_events(self, lookback_minutes=60):
         """
         Retrieve and normalize Exchange audit events.
+
+        This method lists available content blobs for the given lookback window,
+        downloads each blob, and converts raw audit records into a simplified
+        format consumed by detectors.
         """
         blobs = self.list_exchange_content(lookback_minutes=lookback_minutes)
 
@@ -126,8 +152,10 @@ class M365AuditClient:
             records = self.download_content_blob(content_uri)
 
             for record in records:
+                # Use the most descriptive operation field available.
                 operation = record.get("Operation") or "Unknown"
 
+                # Attempt several fields for the actor/user who performed the action.
                 user = (
                     record.get("UserId")
                     or record.get("MailboxOwnerUPN")
@@ -135,12 +163,14 @@ class M365AuditClient:
                     or "Unknown"
                 )
 
+                # Create a stable event ID using available fields.
                 record_id = (
                     record.get("Id")
                     or record.get("RecordId")
                     or f"{operation}:{user}:{record.get('CreationTime')}"
                 )
 
+                # Determine the target object for the audit event.
                 target = (
                     record.get("ObjectId")
                     or record.get("MailboxOwnerUPN")
