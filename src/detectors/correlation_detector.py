@@ -84,6 +84,8 @@ def is_suspicious_signin(event):
     """
     status = event.get("status")
     hour = event.get("hour")
+    risk_level = event.get("risk_level_aggregated")
+    conditional_access_status = event.get("conditional_access_status")
 
     # Any failed sign-in is considered suspicious.
     if status == "failure":
