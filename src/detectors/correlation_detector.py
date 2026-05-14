@@ -62,6 +62,14 @@ def minutes_between(first_time, second_time):
     """
     return abs((second_time - first_time).total_seconds()) / 60
 
+def get_suspicious_signins(signin_events):
+    """
+    Return only sign-in events that are suspicious enough for correlation.
+    """
+    return [
+        event for event in signin_events
+        if is_suspicious_signin(event)
+    ]
 
 def get_correlation_severity(minutes_difference):
     """
@@ -196,16 +204,27 @@ def detect_signin_email_correlation(signin_events, email_events):
     return alerts
 
 
-def detect_correlations(signin_events, email_events):
+def detect_correlations(signin_events, email_events, cached_signins=None):
     """
     Main correlation detector entry point.
 
-    main.py calls this after individual detectors run.
+    signin_events:
+        New sign-ins from this run.
+
+    email_events:
+        New email audit events from this run.
+
+    cached_signins:
+        Suspicious sign-ins from previous runs.
     """
     alerts = []
 
+    cached_signins = cached_signins or []
+
+    combined_signins = cached_signins + signin_events
+
     alerts += detect_signin_email_correlation(
-        signin_events=signin_events,
+        signin_events=combined_signins,
         email_events=email_events,
     )
 
