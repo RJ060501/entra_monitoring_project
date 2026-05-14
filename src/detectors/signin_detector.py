@@ -42,13 +42,13 @@ def detect_unusual_login_time(events):
 
         hour = event.get("hour")
 
-        # Treat logins before 6 AM or after 10 PM as unusual.
-        if hour is not None and (hour < 6 or hour > 22):
+        # Treat logins before 1 AM or after 4:59M as unusual.
+        if hour is not None and (1 <= hour <= 4):
             alerts.append({
                 "severity": "medium",
                 "type": "Unusual Login Time",
                 "user": user,
-                "detail": f"Login at hour {hour}",
+                "detail": f"Login at hour {hour} UTC",
                 "location": event.get("location", "Unknown"),
                 "source": "Entra Sign-In Logs",
             })
