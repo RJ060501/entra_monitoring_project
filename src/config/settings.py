@@ -21,6 +21,10 @@ SUPPRESSED_USERS = [
     "bdavis@resolutgroup.com",
 ]
 
+INTERNAL_DOMAINS = {
+    "resolutgroup.com",
+}
+
 
 def load_dotenv():
     """Load local .env values into the process environment.

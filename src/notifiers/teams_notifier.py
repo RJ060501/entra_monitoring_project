@@ -14,41 +14,68 @@ Why this version:
 - So this notifier now matches that working pattern
 """
 
+"""
+Microsoft Teams notifier.
+
+Sends detection alerts to Microsoft Teams using an incoming workflow/webhook.
+
+This version uses Adaptive Cards so alerts are easier to read than plain text.
+"""
+
 import json
 import urllib.request
 import urllib.error
 
 
+SEVERITY_STYLE = {
+    "critical": {
+        "title": "CRITICAL SECURITY ALERT",
+        "emoji": "🚨",
+        "color": "Attention",
+    },
+    "high": {
+        "title": "HIGH SECURITY ALERT",
+        "emoji": "⚠️",
+        "color": "Attention",
+    },
+    "medium": {
+        "title": "MEDIUM SECURITY ALERT",
+        "emoji": "🔎",
+        "color": "Warning",
+    },
+    "low": {
+        "title": "LOW SECURITY ALERT",
+        "emoji": "ℹ️",
+        "color": "Default",
+    },
+    "info": {
+        "title": "SECURITY NOTICE",
+        "emoji": "ℹ️",
+        "color": "Default",
+    },
+}
+
+
+def get_severity_style(severity):
+    """
+    Return display settings for an alert severity.
+    """
+    normalized = str(severity or "info").lower()
+    return SEVERITY_STYLE.get(normalized, SEVERITY_STYLE["info"])
+
+
 def build_payload(alert):
     """
-    Build the Adaptive Card payload for a single alert.
-
-    The returned payload is a Teams-compatible JSON object representing a
-    single adaptive card attachment. It is built from normalized alert fields.
-
-    Expected alert fields:
-    - severity
-    - type
-    - user
-    - detail
-    - location
-    - source
+    Build a Microsoft Teams Adaptive Card payload for one alert.
     """
-    severity = alert.get("severity", "info").upper()
+    severity = str(alert.get("severity", "info")).lower()
+    style = get_severity_style(severity)
+
     alert_type = alert.get("type", "Unknown Alert")
     user = alert.get("user", "Unknown User")
-    detail = alert.get("detail", "No detail provided")
     location = alert.get("location", "Unknown")
     source = alert.get("source", "Unknown Source")
-
-    # Build a single text block that summarizes the alert details.
-    message = (
-        f"Type: {alert_type}\n"
-        f"User: {user}\n"
-        f"Location: {location}\n"
-        f"Source: {source}\n"
-        f"Detail: {detail}"
-    )
+    detail = alert.get("detail", "No detail provided")
 
     payload = {
         "type": "message",
@@ -62,19 +89,56 @@ def build_payload(alert):
                     "body": [
                         {
                             "type": "TextBlock",
+                            "text": f"{style['emoji']} {style['title']}",
                             "size": "Large",
                             "weight": "Bolder",
-                            "text": f"{severity} ALERT"
+                            "color": style["color"],
+                            "wrap": True,
                         },
                         {
                             "type": "TextBlock",
-                            "text": message,
-                            "wrap": True
-                        }
-                    ]
-                }
+                            "text": alert_type,
+                            "size": "Medium",
+                            "weight": "Bolder",
+                            "wrap": True,
+                        },
+                        {
+                            "type": "FactSet",
+                            "facts": [
+                                {
+                                    "title": "Severity",
+                                    "value": severity.upper(),
+                                },
+                                {
+                                    "title": "User",
+                                    "value": user,
+                                },
+                                {
+                                    "title": "Location",
+                                    "value": location,
+                                },
+                                {
+                                    "title": "Source",
+                                    "value": source,
+                                },
+                            ],
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": "Details",
+                            "weight": "Bolder",
+                            "spacing": "Medium",
+                            "wrap": True,
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": detail,
+                            "wrap": True,
+                        },
+                    ],
+                },
             }
-        ]
+        ],
     }
 
     return payload
@@ -82,10 +146,7 @@ def build_payload(alert):
 
 def post_to_teams(webhook_url, payload, timeout=10):
     """
-    Send the payload to Teams.
-
-    Returns:
-        True if the request succeeded, otherwise False.
+    Send one Adaptive Card payload to Teams.
     """
     data = json.dumps(payload).encode("utf-8")
 
@@ -102,32 +163,32 @@ def post_to_teams(webhook_url, payload, timeout=10):
             response_body = response.read().decode("utf-8", errors="ignore")
 
             print(f"Teams response status: {status_code}")
+
             if response_body:
                 print(f"Teams response body: {response_body}")
 
-            # Consider any 2xx response a success.
             return 200 <= status_code < 300
 
     except urllib.error.HTTPError as exc:
-        # HTTPError is returned for non-2xx status codes.
         error_body = ""
+
         try:
             error_body = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             pass
 
         print(f"Teams delivery failed with HTTP error: {exc.code} {exc.reason}")
+
         if error_body:
             print(f"Teams error body: {error_body}")
+
         return False
 
     except urllib.error.URLError as exc:
-        # URLError is returned for network-level failures like DNS or connectivity.
         print(f"Teams delivery failed with network error: {exc.reason}")
         return False
 
     except Exception as exc:
-        # Catch-all for any unexpected errors.
         print(f"Teams delivery failed with unexpected error: {exc}")
         return False
 
@@ -135,9 +196,6 @@ def post_to_teams(webhook_url, payload, timeout=10):
 def send_alert(alert, settings):
     """
     Send one alert to Teams.
-
-    This function reads the webhook URL from settings, builds the payload,
-    and posts it to Teams. It also prints debug information.
     """
     webhook_url = settings.get("teams_webhook_url", "").strip()
 
@@ -163,17 +221,8 @@ def send_alert(alert, settings):
 
 def send_alerts(alerts, settings):
     """
-    Send a list of alerts to Teams, one message per alert.
-
-    This function loops through all generated alerts and sends them one by
-    one. It prints a summary of successes and failures.
+    Send a list of alerts to Teams.
     """
-    webhook_url = settings.get("teams_webhook_url", "").strip()
-
-    if not webhook_url:
-        print("Teams notifier skipped: no TEAMS_WEBHOOK_URL configured.")
-        return
-
     if not alerts:
         print("Teams notifier: no alerts to send.")
         return

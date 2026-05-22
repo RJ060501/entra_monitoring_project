@@ -14,14 +14,7 @@ Current focus:
 
 import re
 
-from config.settings import SUPPRESSED_USERS
-
-
-# Domains considered internal/trusted.
-# Later, this can move into settings.py.
-INTERNAL_DOMAINS = {
-    "resolutgroup.com",
-}
+from config.settings import SUPPRESSED_USERS, INTERNAL_DOMAINS
 
 
 # Mailbox and transport rule operations we care about.
@@ -76,7 +69,7 @@ def detect_email_events(events):
     """Run all email event detectors and return combined alerts."""
     alerts = []
 
-    alerts += detect_mailbox_rule_changes(events)
+    # alerts += detect_mailbox_rule_changes(events)
     # alerts += detect_forwarding_changes(events)
     alerts += detect_external_forwarding(events)
     # alerts += detect_sensitive_keyword_rules(events)
@@ -131,7 +124,7 @@ def get_sensitive_keyword_matches(event):
 
     return matched_keywords(raw_text, SENSITIVE_KEYWORDS)
 
-
+# Use later for context and dashboard metrics
 def detect_mailbox_rule_changes(events):
     """Detect mailbox rule creation/modification/removal events."""
     alerts = []

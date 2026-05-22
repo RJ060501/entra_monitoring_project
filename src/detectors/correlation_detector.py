@@ -19,7 +19,7 @@ Current correlation logic:
     - 1–7 days: medium / investigation context
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 SUSPICIOUS_EMAIL_OPERATIONS = {
@@ -42,16 +42,29 @@ FORWARDING_KEYWORDS = [
 
 def parse_datetime(value):
     """
-    Convert a Microsoft timestamp string into a Python datetime object.
+    Convert a Microsoft timestamp string into a timezone-aware UTC datetime.
 
-    Microsoft timestamps usually end in Z, which means UTC.
-    Python expects +00:00 for ISO timezone parsing, so we convert Z to +00:00.
+    Microsoft APIs may return timestamps in slightly different formats:
+    - 2026-05-14T20:00:00Z
+    - 2026-05-14T20:00:00
+    - 2026-05-14T20:00:00+00:00
+
+    Python cannot compare/subtract timezone-aware and timezone-naive datetimes.
+    This function normalizes everything to timezone-aware UTC.
     """
     if not value:
         return None
 
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        # If timestamp has no timezone, assume it is UTC.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        # Normalize any timezone-aware value to UTC.
+        return parsed.astimezone(timezone.utc)
+
     except Exception:
         return None
 
@@ -125,16 +138,25 @@ def is_suspicious_signin(event):
 
 def is_mailbox_rule_or_forwarding_event(event):
     """
-    Decide whether an email audit event looks related to mailbox rules,
-    mailbox changes, forwarding, or redirect behavior.
+    Decide whether an email audit event is strong enough for correlation.
+
+    We intentionally do NOT correlate generic operations like Update, Create,
+    MailItemsAccessed, Send, or MoveToDeletedItems by themselves because they are noisy.
+
+    Correlation should focus on higher-confidence mailbox configuration behavior.
     """
     operation = event.get("operation", "")
     raw_text = str(event.get("raw", "")).lower()
 
-    if operation in SUSPICIOUS_EMAIL_OPERATIONS:
+    if operation in {"New-InboxRule", "Set-InboxRule", "Remove-InboxRule", "Set-Mailbox"}:
         return True
 
-    if any(keyword in raw_text for keyword in FORWARDING_KEYWORDS):
+    forwarding_terms_found = any(
+        keyword in raw_text
+        for keyword in FORWARDING_KEYWORDS
+    )
+
+    if forwarding_terms_found and operation in {"New-InboxRule", "Set-InboxRule", "Set-Mailbox"}:
         return True
 
     return False

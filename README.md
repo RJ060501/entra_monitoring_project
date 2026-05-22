@@ -1,89 +1,282 @@
 # Entra Monitoring Project
 
-Automated Microsoft Entra monitoring system that ingests sign-in and audit logs via Microsoft Graph, detects suspicious activity, and sends alerts to Microsoft Teams.
+Automated Microsoft Entra and Microsoft 365 monitoring platform that ingests sign-in and audit logs via Microsoft Graph and the Microsoft 365 Management Activity API, detects suspicious activity patterns, and sends alerts to Microsoft Teams.
 
 ---
 
-## Overview
+# Features
 
-This project provides:
-
-- Real-time monitoring of Entra sign-in activity
-- Detection of suspicious login patterns (e.g., failed → success)
-- Alerting to Microsoft Teams
+- Microsoft Entra sign-in monitoring
+- Microsoft Entra audit log monitoring
+- Microsoft 365 / Exchange audit log monitoring
+- External mailbox forwarding detection
+- Mailbox hide/delete rule detection
+- Correlation between suspicious sign-ins and mailbox activity
+- Microsoft Teams Adaptive Card alerting
 - State tracking to prevent duplicate alerts
-- Scheduled execution via systemd
+- Rolling suspicious sign-in cache
+- Scheduled execution
+- Docker-ready architecture
 
 ---
 
-## Project Structure
+# Detection Examples
 
+The platform currently detects:
+
+- Failed sign-ins followed by success
+- New/unusual sign-in locations
+- External mailbox forwarding
+- Mailbox rules that:
+  - move mail to Deleted Items
+  - archive messages
+  - mark messages as read
+  - move mail to junk/rss folders
+- Rules targeting sensitive keywords:
+  - docusign
+  - mfa
+  - password
+  - payroll
+  - invoice
+  - wire
+  - sharepoint
+  - teams
+- Correlation between suspicious sign-ins and mailbox rule activity
 
 ---
 
-## Setup
+# Project Structure
 
-Activate virtual environment:
+```text
+entra_monitoring_project/
+├── config/
+├── logs/
+├── src/
+│   ├── clients/
+│   ├── core/
+│   ├── detectors/
+│   ├── notifiers/
+│   ├── tests/
+│   └── main.py
+├── state/
+├── systemd/
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── .env
+└── README.md
+```
+
+---
+
+# Setup
+
+## Create Virtual Environment
+
+```bash
+python3 -m venv .venv
+```
+
+## Activate Virtual Environment
+
+```bash
 source .venv/bin/activate
+```
 
-Run manually:
+## Install Dependencies
 
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+# Manual Execution
+
+Run one monitoring cycle manually:
+
+```bash
 python3 src/main.py
+```
 
 ---
 
-## Useful Commands
+# Test Teams Alert
 
-### Service (Manual Run)
+Send a manual Teams test alert:
 
-Start service:
+```bash
+PYTHONPATH=src python3 src/tests/send_test_alert.py
+```
+
+---
+
+# Useful Commands
+
+## Service (Manual Run)
+
+Start service manually:
+
+```bash
 sudo systemctl start entra-monitor.service
+```
 
-This stops the automatic 15-minute runs:
+Stop scheduled timer:
+
+```bash
 sudo systemctl stop entra-monitor.timer
+```
 
-To also prevent it from starting on reboot:
+Prevent timer from starting on boot:
+
+```bash
 sudo systemctl disable entra-monitor.timer
+```
 
-If you manually started it or it’s mid-run:
+Stop currently running service:
+
+```bash
 sudo systemctl stop entra-monitor.service
+```
 
-Check status:
+Check service status:
+
+```bash
 sudo systemctl status entra-monitor.service
+```
 
 ---
 
-### Logs
+# Logs
 
 Application logs:
-cat logs/entra_monitor.log
 
+```bash
+cat logs/entra_monitor.log
+```
+
+Follow logs live:
+
+```bash
+tail -f logs/entra_monitor.log
+```
 
 Systemd logs:
-journalctl -u entra-monitor.service -n 50 --no-pager
 
+```bash
+journalctl -u entra-monitor.service -n 50 --no-pager
+```
 
 ---
 
-### Timer (Scheduled Execution)
+# Timer (Scheduled Execution)
 
 Enable and start timer:
-sudo systemctl enable --now entra-monitor.timer
 
+```bash
+sudo systemctl enable --now entra-monitor.timer
+```
 
 Check timer:
-systemctl list-timers | grep entra-monitor
 
+```bash
+systemctl list-timers | grep entra-monitor
+```
 
 Stop timer:
-sudo systemctl stop entra-monitor.timer
 
+```bash
+sudo systemctl stop entra-monitor.timer
+```
 
 ---
 
-## Notes
+# Environment Variables
 
-- The application runs every 15 minutes via systemd timer
-- Alerts are only sent for new events (state tracking enabled)
-- Ensure `.env` is configured with required credentials
-- Requires systemd (may need to be enabled in WSL)
+The application uses environment variables stored in `.env`.
+
+Important values include:
+
+```env
+TENANT_ID=
+CLIENT_ID=
+CLIENT_SECRET=
+TEAMS_WEBHOOK_URL=
+INTERNAL_DOMAINS=
+```
+
+If deploying to another company/tenant, typically only these values need to change.
+
+---
+
+# Docker Deployment
+
+This project is designed to support Docker deployment for portability between environments and organizations.
+
+Docker packages:
+- Python version
+- dependencies
+- monitoring application
+- runtime behavior
+
+This allows the platform to be deployed consistently across systems without rebuilding the environment manually.
+
+The intended Docker deployment model is:
+
+```text
+container starts
+→ monitor runs
+→ sleeps 15 minutes
+→ monitor runs again
+```
+
+This removes the need for systemd scheduling inside the container.
+
+Future Docker deployment will include:
+
+```text
+Dockerfile
+docker-compose.yml
+.dockerignore
+persistent volume mounts for:
+- logs/
+- state/
+```
+
+---
+
+# Notes
+
+- Alerts are only generated for new events
+- State tracking prevents duplicate alerts
+- Microsoft audit logs may appear with slight delays
+- Requires Microsoft Graph API permissions
+- Requires Microsoft 365 Management Activity API permissions
+- Requires Microsoft Teams incoming webhook/workflow
+- Works well in Linux or WSL environments
+- Docker deployment is planned for cross-environment portability
+
+---
+
+# Current Status
+
+Current implementation includes:
+
+- Entra sign-in ingestion
+- Entra audit ingestion
+- Microsoft 365 audit ingestion
+- Detection engine
+- Correlation engine
+- Teams alerting
+- Persistent state tracking
+- Rolling suspicious sign-in cache
+- systemd scheduling
+
+Future enhancements may include:
+
+- dashboard/reporting
+- additional behavioral detections
+- threat scoring
+- improved baselining
+- SIEM integration
+- Docker deployment
