@@ -119,6 +119,9 @@ def is_suspicious_signin(event):
 
     if status == "failure":
         return True
+    
+    if event.get("new_location"):
+        return True
 
     # Microsoft Graph sign-in timestamps are UTC.
     # This roughly maps to overnight U.S. login hours.
