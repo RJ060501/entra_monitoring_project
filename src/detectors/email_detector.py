@@ -77,6 +77,22 @@ def detect_email_events(events):
 
     return alerts
 
+def clean_rule_target(target):
+    """
+    Return a cleaner rule name from the Exchange target value.
+
+    Exchange audit targets can be very long, so this keeps Teams alerts readable.
+    """
+    if not target:
+        return "Unknown"
+
+    target = str(target)
+
+    if "\\" in target:
+        return target.split("\\")[-1]
+
+    return target
+
 
 def get_raw_text(event):
     """Return lowercased raw event text for easy keyword searching."""
@@ -245,19 +261,23 @@ def detect_sensitive_keyword_rules(events):
 
 def detect_hide_or_delete_rules(events):
     """
-    Detect rules that may hide, delete, archive, move, or suppress emails.
+    Detect mailbox rules that may hide, delete, archive, move, or suppress emails.
 
-    Severity:
-    - High by default.
-    - Still high when sensitive keywords are present, but the detail becomes
-      more useful because it shows what business/security topic was targeted.
-
-    Examples:
-    - Move DocuSign emails to Junk
-    - Mark MFA emails as read
-    - Move invoice emails to RSS
+    Severity logic:
+    - move only = low/context
+    - move + sensitive keyword = high
+    - move + deleted/junk/archive/rss/markasread = high
+    - hide/delete targeting sensitive keywords = high
     """
     alerts = []
+
+    strong_hide_delete_keywords = [
+        "deleted",
+        "archive",
+        "rss",
+        "junk",
+        "markasread",
+    ]
 
     for event in events:
         user = event.get("user", "Unknown")
@@ -271,30 +291,46 @@ def detect_hide_or_delete_rules(events):
         if not is_rule_related_operation(operation):
             continue
 
-        hide_delete_matches = matched_keywords(raw_text, HIDE_OR_DELETE_KEYWORDS)
+        move_matches = matched_keywords(raw_text, ["move"])
+        strong_matches = matched_keywords(raw_text, strong_hide_delete_keywords)
+        sensitive_matches = get_sensitive_keyword_matches(event)
 
-        if not hide_delete_matches:
+        if not move_matches and not strong_matches:
             continue
 
-        keyword_matches = get_sensitive_keyword_matches(event)
+        rule_name = clean_rule_target(event.get("target", "Unknown"))
 
-        keyword_context = ""
-        if keyword_matches:
-            keyword_context = (
-                f" Sensitive keyword(s): {', '.join(sorted(set(keyword_matches)))}."
+        if strong_matches or (move_matches and sensitive_matches):
+            severity = "high"
+        else:
+            severity = "low"
+
+        detail_parts = [
+            f"Mailbox rule may move, hide, delete, archive, or suppress mail.",
+            f"Rule: {rule_name}.",
+            f"Operation: {operation}.",
+        ]
+
+        if move_matches:
+            detail_parts.append(
+                f"Move term(s): {', '.join(sorted(set(move_matches)))}."
+            )
+
+        if strong_matches:
+            detail_parts.append(
+                f"Hide/delete term(s): {', '.join(sorted(set(strong_matches)))}."
+            )
+
+        if sensitive_matches:
+            detail_parts.append(
+                f"Sensitive keyword(s): {', '.join(sorted(set(sensitive_matches)))}."
             )
 
         alerts.append({
-            "severity": "high",
+            "severity": severity,
             "type": "Mailbox Rule May Hide or Delete Mail",
             "user": user,
-            "detail": (
-                f"Mailbox rule/configuration event contains hide/delete "
-                f"term(s): {', '.join(sorted(set(hide_delete_matches)))}. "
-                f"Operation: {operation}. "
-                f"Target: {event.get('target', 'Unknown')}."
-                f"{keyword_context}"
-            ),
+            "detail": " ".join(detail_parts),
             "location": "N/A - Exchange audit event",
             "source": "Microsoft 365 Audit Logs",
         })

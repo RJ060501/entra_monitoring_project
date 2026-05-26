@@ -108,8 +108,10 @@ def detect_failed_then_success(events):
 
             #Change to 3 later, but for now 1 just for testing.
             elif status == "success" and len(failures_before_success) >= 3:
+                severity = "high" if event.get("new_location") else "medium"
+                
                 alerts.append({
-                    "severity": "high",
+                    "severity": severity,
                     "type": "Failed Sign-ins Followed by Success",
                     "user": user,
                     "detail": (

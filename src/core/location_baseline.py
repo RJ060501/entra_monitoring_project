@@ -70,11 +70,18 @@ def normalize_location(location):
 def is_new_location(user, location, baseline):
     """
     Determine whether a sign-in location is new for this user.
+
+    Important:
+    If the user has no known locations yet, we treat the current location as
+    baseline seeding, not suspicious activity.
     """
     normalized_user = str(user).lower().strip()
     normalized_location = normalize_location(location)
 
     known_locations = baseline.get(normalized_user, [])
+
+    if not known_locations:
+        return False
 
     return normalized_location not in known_locations
 

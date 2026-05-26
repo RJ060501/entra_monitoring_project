@@ -43,6 +43,13 @@ from core.correlation_cache import (
     add_suspicious_signins_to_cache,
 )
 
+from core.location_baseline import (
+    load_location_baseline,
+    save_location_baseline,
+    apply_location_baseline,
+    update_location_baseline,
+)
+
 from detectors.signin_detector import detect_signin_events
 from detectors.audit_detector import detect_audit_events
 from detectors.email_detector import detect_email_events
@@ -96,6 +103,11 @@ def main():
     signins = entra_client.get_signins()
     audits = entra_client.get_audits()
     email_events = m365_client.get_email_audit_events()
+    
+    #Load known sign-in Locations per user.
+    location_baseline = load_location_baseline()
+    # Apply new_location flags before detections run.
+    signins = apply_location_baseline(signins, location_baseline)
 
     # Filter out events that were already processed in previous runs.
     new_signins = filter_new_events(
@@ -173,6 +185,14 @@ def main():
     )
 
     save_state(state)
+    
+    # Update location baseline with latest successful sign-ins.
+    location_baseline = update_location_baseline(
+        signins,
+        location_baseline,
+    )
+
+    save_location_baseline(location_baseline)
 
     # Update rolling suspicious sign-in cache for future correlation.
     updated_cache = add_suspicious_signins_to_cache(

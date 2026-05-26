@@ -193,30 +193,37 @@ def post_to_teams(webhook_url, payload, timeout=10):
         return False
 
 
-def send_alert(alert, settings):
+def send_alerts(alerts, settings):
     """
-    Send one alert to Teams.
+    Send a list of alerts to Teams.
+
+    Low/context alerts are intentionally not sent to Teams to avoid noise.
+    They can still appear in console/log output.
     """
-    webhook_url = settings.get("teams_webhook_url", "").strip()
+    alerts = [
+        alert for alert in alerts
+        if str(alert.get("severity", "")).lower() != "low"
+    ]
 
-    if not webhook_url:
-        print("Teams notifier skipped: no TEAMS_WEBHOOK_URL configured.")
-        return False
+    if not alerts:
+        print("Teams notifier: no alerts to send.")
+        return
 
-    payload = build_payload(alert)
+    print(f"Teams notifier: sending {len(alerts)} alert(s).")
 
-    print("Sending Teams alert...")
-    print(f"Alert type: {alert.get('type', 'Unknown Alert')}")
-    print(f"Alert user: {alert.get('user', 'Unknown User')}")
+    success_count = 0
+    failure_count = 0
 
-    success = post_to_teams(webhook_url, payload)
+    for alert in alerts:
+        if send_alert(alert, settings):
+            success_count += 1
+        else:
+            failure_count += 1
 
-    if success:
-        print(f"Teams alert sent for {alert.get('type', 'Unknown Alert')}.")
-    else:
-        print(f"Teams alert failed for {alert.get('type', 'Unknown Alert')}.")
-
-    return success
+    print(
+        f"Teams notifier complete. "
+        f"Success: {success_count}, Failure: {failure_count}"
+    )
 
 
 def send_alerts(alerts, settings):

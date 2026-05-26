@@ -84,27 +84,25 @@ def get_suspicious_signins(signin_events):
         if is_suspicious_signin(event)
     ]
 
-def get_correlation_severity(minutes_difference):
-    """
-    Decide alert severity based on how close together the suspicious sign-in
-    and mailbox activity occurred.
+#Depricated and reimplimented in get_correlation_result function below.
+# def get_correlation_severity(minutes_difference):
+#     """
+#     Decide alert severity based on how close together the suspicious sign-in
+#     and mailbox activity occurred.
 
-    Timeline:
-    - 0–60 minutes: critical
-    - 1–24 hours: high
-    - 1–7 days: medium
-    - over 7 days: no correlation alert
-    """
-    if minutes_difference <= 60:
-        return "critical", "0–60 minute critical window"
+#     Teams alerts:
+#     - 0–60 minutes: critical
+#     - 1–24 hours: high
 
-    if minutes_difference <= 1440:
-        return "high", "1–24 hour high-confidence window"
+#     1–7 day matches are useful investigation context, but too noisy for Teams.
+#     """
+#     if minutes_difference <= 60:
+#         return "critical", "0–60 minute critical window"
 
-    if minutes_difference <= 10080:
-        return "medium", "1–7 day investigation/context window"
+#     if minutes_difference <= 1440:
+#         return "high", "1–24 hour high-confidence window"
 
-    return None, None
+#     return None, None
 
 
 def is_suspicious_signin(event):
@@ -161,6 +159,78 @@ def is_mailbox_rule_or_forwarding_event(event):
 
     return False
 
+def get_correlation_result(signin_event, email_event, minutes_difference):
+    """
+    Determine correlation severity based on:
+    - time difference
+    - mailbox behavior type
+    """
+
+    raw_text = str(email_event.get("raw", "")).lower()
+    operation = email_event.get("operation", "")
+
+    forwarding_terms = [
+        "forward",
+        "forwardto",
+        "redirectto",
+        "forwardingsmtpaddress",
+    ]
+
+    hide_delete_terms = [
+        "deleted",
+        "archive",
+        "rss",
+        "junk",
+        "markasread",
+    ]
+
+    is_forwarding = any(term in raw_text for term in forwarding_terms)
+
+    is_hide_delete = any(term in raw_text for term in hide_delete_terms)
+
+    is_generic_rule = operation in {
+        "New-InboxRule",
+        "Set-InboxRule",
+    }
+
+    # External forwarding
+    if is_forwarding:
+        if minutes_difference <= 1440:
+            return (
+                "critical",
+                "Suspicious sign-in + external forwarding within 24 hours",
+            )
+
+    # Hide/delete mailbox behavior
+    if is_hide_delete:
+        if minutes_difference <= 60:
+            return (
+                "critical",
+                "Suspicious sign-in + mailbox hide/delete rule within 60 minutes",
+            )
+
+        if minutes_difference <= 1440:
+            return (
+                "high",
+                "Suspicious sign-in + mailbox hide/delete rule within 24 hours",
+            )
+
+    # Generic mailbox rule activity
+    if is_generic_rule:
+        if minutes_difference <= 60:
+            return (
+                "high",
+                "Suspicious sign-in + mailbox rule within 60 minutes",
+            )
+
+        if minutes_difference <= 1440:
+            return (
+                "medium",
+                "Suspicious sign-in + mailbox rule within 24 hours",
+            )
+
+    return None, None
+
 
 def detect_signin_email_correlation(signin_events, email_events):
     """
@@ -199,7 +269,11 @@ def detect_signin_email_correlation(signin_events, email_events):
                 continue
 
             minutes_diff = minutes_between(signin_time, email_time)
-            severity, window_label = get_correlation_severity(minutes_diff)
+            severity, window_label = get_correlation_result(
+                signin,
+                email_event,
+                minutes_diff
+            )
 
             if not severity:
                 continue
