@@ -51,6 +51,18 @@ SENSITIVE_KEYWORDS = [
     "payroll",
     "wire",
     "teams",
+    "review",
+    "approval",
+    "urgent",
+    "contract",
+    "settlement",
+    "canvas",
+    "asap",
+    "payment",
+    "vendor",
+    "nda",
+    "approval",
+    "contract"
 ]
 
 

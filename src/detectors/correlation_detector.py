@@ -83,6 +83,47 @@ def get_suspicious_signins(signin_events):
         event for event in signin_events
         if is_suspicious_signin(event)
     ]
+    
+def get_email_event_behavior(email_event):
+    """
+    Classify the mailbox event into a behavior category.
+
+    This helps correlation severity depend on what actually happened,
+    instead of treating every mailbox event the same.
+    """
+    operation = email_event.get("operation", "")
+    raw_text = str(email_event.get("raw", "")).lower()
+
+    forwarding_terms = [
+        "forward",
+        "forwardto",
+        "redirectto",
+        "forwardingsmtpaddress",
+        "forwardingaddress",
+        "delivertomailboxandforward",
+    ]
+
+    hide_delete_terms = [
+        "deleted",
+        "archive",
+        "rss",
+        "junk",
+        "markasread",
+    ]
+
+    if any(term in raw_text for term in forwarding_terms):
+        return "external_forwarding"
+
+    if any(term in raw_text for term in hide_delete_terms):
+        return "hide_delete_rule"
+
+    if operation in {"New-InboxRule", "Set-InboxRule", "Set-Mailbox"}:
+        return "generic_mailbox_rule"
+
+    if operation == "Remove-InboxRule":
+        return "removed_mailbox_rule"
+
+    return "unknown"
 
 #Depricated and reimplimented in get_correlation_result function below.
 # def get_correlation_severity(minutes_difference):
@@ -139,73 +180,37 @@ def is_suspicious_signin(event):
 
 def is_mailbox_rule_or_forwarding_event(event):
     """
-    Decide whether an email audit event is strong enough for correlation.
+    Decide whether an email audit event is worth considering for correlation.
 
-    We intentionally do NOT correlate generic operations like Update, Create,
-    MailItemsAccessed, Send, or MoveToDeletedItems by themselves because they are noisy.
-
-    Correlation should focus on higher-confidence mailbox configuration behavior.
+    Remove-InboxRule is kept as context, but it should not create strong
+    Possible Email Account Compromise alerts by itself.
     """
-    operation = event.get("operation", "")
-    raw_text = str(event.get("raw", "")).lower()
+    behavior = get_email_event_behavior(event)
 
-    if operation in {"New-InboxRule", "Set-InboxRule", "Remove-InboxRule", "Set-Mailbox"}:
-        return True
-
-    forwarding_terms_found = any(
-        keyword in raw_text
-        for keyword in FORWARDING_KEYWORDS
-    )
-
-    if forwarding_terms_found and operation in {"New-InboxRule", "Set-InboxRule", "Set-Mailbox"}:
-        return True
-
-    return False
+    return behavior in {
+        "external_forwarding",
+        "hide_delete_rule",
+        "generic_mailbox_rule",
+        "removed_mailbox_rule",
+    }
 
 def get_correlation_result(signin_event, email_event, minutes_difference):
     """
     Determine correlation severity based on:
-    - time difference
+    - same-user suspicious sign-in
     - mailbox behavior type
+    - time distance between events
     """
+    behavior = get_email_event_behavior(email_event)
 
-    raw_text = str(email_event.get("raw", "")).lower()
-    operation = email_event.get("operation", "")
-
-    forwarding_terms = [
-        "forward",
-        "forwardto",
-        "redirectto",
-        "forwardingsmtpaddress",
-    ]
-
-    hide_delete_terms = [
-        "deleted",
-        "archive",
-        "rss",
-        "junk",
-        "markasread",
-    ]
-
-    is_forwarding = any(term in raw_text for term in forwarding_terms)
-
-    is_hide_delete = any(term in raw_text for term in hide_delete_terms)
-
-    is_generic_rule = operation in {
-        "New-InboxRule",
-        "Set-InboxRule",
-    }
-
-    # External forwarding
-    if is_forwarding:
+    if behavior == "external_forwarding":
         if minutes_difference <= 1440:
             return (
                 "critical",
                 "Suspicious sign-in + external forwarding within 24 hours",
             )
 
-    # Hide/delete mailbox behavior
-    if is_hide_delete:
+    if behavior == "hide_delete_rule":
         if minutes_difference <= 60:
             return (
                 "critical",
@@ -218,8 +223,7 @@ def get_correlation_result(signin_event, email_event, minutes_difference):
                 "Suspicious sign-in + mailbox hide/delete rule within 24 hours",
             )
 
-    # Generic mailbox rule activity
-    if is_generic_rule:
+    if behavior == "generic_mailbox_rule":
         if minutes_difference <= 60:
             return (
                 "high",
@@ -230,6 +234,13 @@ def get_correlation_result(signin_event, email_event, minutes_difference):
             return (
                 "medium",
                 "Suspicious sign-in + mailbox rule within 24 hours",
+            )
+
+    if behavior == "removed_mailbox_rule":
+        if minutes_difference <= 60:
+            return (
+                "medium",
+                "Suspicious sign-in + mailbox rule removal within 60 minutes",
             )
 
     return None, None

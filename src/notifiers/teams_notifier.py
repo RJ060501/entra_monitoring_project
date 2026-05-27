@@ -193,6 +193,32 @@ def post_to_teams(webhook_url, payload, timeout=10):
         return False
 
 
+def send_alert(alert, settings):
+    """
+    Send one alert to Microsoft Teams.
+    """
+    webhook_url = settings.get("teams_webhook_url", "").strip()
+
+    if not webhook_url:
+        print("Teams notifier skipped: no TEAMS_WEBHOOK_URL configured.")
+        return False
+
+    payload = build_payload(alert)
+
+    print("Sending Teams alert...")
+    print(f"Alert type: {alert.get('type', 'Unknown Alert')}")
+    print(f"Alert user: {alert.get('user', 'Unknown User')}")
+
+    success = post_to_teams(webhook_url, payload)
+
+    if success:
+        print(f"Teams alert sent for {alert.get('type', 'Unknown Alert')}.")
+    else:
+        print(f"Teams alert failed for {alert.get('type', 'Unknown Alert')}.")
+
+    return success
+
+
 def send_alerts(alerts, settings):
     """
     Send a list of alerts to Teams.
@@ -205,31 +231,6 @@ def send_alerts(alerts, settings):
         if str(alert.get("severity", "")).lower() != "low"
     ]
 
-    if not alerts:
-        print("Teams notifier: no alerts to send.")
-        return
-
-    print(f"Teams notifier: sending {len(alerts)} alert(s).")
-
-    success_count = 0
-    failure_count = 0
-
-    for alert in alerts:
-        if send_alert(alert, settings):
-            success_count += 1
-        else:
-            failure_count += 1
-
-    print(
-        f"Teams notifier complete. "
-        f"Success: {success_count}, Failure: {failure_count}"
-    )
-
-
-def send_alerts(alerts, settings):
-    """
-    Send a list of alerts to Teams.
-    """
     if not alerts:
         print("Teams notifier: no alerts to send.")
         return
