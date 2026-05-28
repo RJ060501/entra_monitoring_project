@@ -86,13 +86,25 @@ def get_suspicious_signins(signin_events):
     
 def get_email_event_behavior(email_event):
     """
-    Classify the mailbox event into a behavior category.
+    Classify mailbox configuration events for correlation.
 
-    This helps correlation severity depend on what actually happened,
-    instead of treating every mailbox event the same.
+    Important:
+    Only mailbox rule/configuration operations should be correlated.
+    Normal mailbox activity like MailItemsAccessed, Send, Update, Create,
+    AttachmentAccess, etc. should never become correlation alerts.
     """
     operation = email_event.get("operation", "")
     raw_text = str(email_event.get("raw", "")).lower()
+    
+    rule_operations = {
+        "New-InboxRule",
+        "Set-InboxRule",
+        "Remove-InboxRule",
+        "Set-Mailbox",
+    }
+
+    if operation not in rule_operations:
+        return "unknown"
 
     forwarding_terms = [
         "forward",
@@ -110,6 +122,7 @@ def get_email_event_behavior(email_event):
         "junk",
         "markasread",
     ]
+    
 
     if any(term in raw_text for term in forwarding_terms):
         return "external_forwarding"

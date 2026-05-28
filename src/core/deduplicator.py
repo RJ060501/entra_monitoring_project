@@ -1,22 +1,21 @@
-"""
-Alert Deduplication
-
-Prevents duplicate alerts from being sent repeatedly.
-
-Current logic:
-- Removes identical alerts within the same run
-
-Future:
-- Add time-based suppression (e.g., 15 minutes)
-"""
-
 def deduplicate_alerts(alerts):
-    """Remove duplicate alerts"""
+    """
+    Remove duplicate or near-duplicate alerts within the same run.
+
+    We intentionally avoid using the full detail field because small changes
+    like time difference can cause duplicate Teams alerts.
+    """
     seen = set()
     unique = []
 
     for alert in alerts:
-        key = (alert["type"], alert["user"], alert["detail"])
+        key = (
+            alert.get("type"),
+            alert.get("user"),
+            alert.get("severity"),
+            alert.get("source"),
+        )
+
         if key not in seen:
             seen.add(key)
             unique.append(alert)
