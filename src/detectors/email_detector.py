@@ -348,7 +348,7 @@ def detect_hide_or_delete_rules(events):
         if strong_matches or (move_matches and sensitive_matches):
             severity = "high"
         elif move_matches:
-            severity = "medium"
+            severity = "low"
         else:
             severity = "low"
 
