@@ -69,7 +69,7 @@ def detect_new_location(events):
         # The normalized sign-in event includes a boolean new_location flag.
         if event.get("new_location"):
             alerts.append({
-                "severity": "medium",
+                "severity": "low",
                 "type": "New Location",
                 "user": user,
                 "detail": f"New location detected: {event.get('location', 'Unknown')}",
