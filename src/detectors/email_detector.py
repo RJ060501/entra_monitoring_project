@@ -110,6 +110,34 @@ def get_raw_text(event):
     """Return lowercased raw event text for easy keyword searching."""
     return str(event.get("raw", "")).lower()
 
+#Remove later. For debugging if keywords are showing up in the right place inside the raw text.
+def get_keyword_context(text, keywords, context_chars=80):
+    """
+    Return short snippets showing where sensitive keywords matched.
+
+    This helps confirm whether a keyword appeared in the actual rule logic
+    or somewhere else in the raw audit payload.
+    """
+    contexts = []
+
+    lowered_text = str(text).lower()
+
+    for keyword in keywords:
+        keyword_lower = keyword.lower()
+        index = lowered_text.find(keyword_lower)
+
+        if index == -1:
+            continue
+
+        start = max(index - context_chars, 0)
+        end = min(index + len(keyword_lower) + context_chars, len(text))
+
+        snippet = str(text)[start:end].replace("\n", " ")
+
+        contexts.append(f"{keyword}: ...{snippet}...")
+
+    return contexts
+
 
 def extract_email_addresses(text):
     """Extract email addresses from raw audit event text."""
@@ -306,6 +334,11 @@ def detect_hide_or_delete_rules(events):
         move_matches = matched_keywords(raw_text, ["move"])
         strong_matches = matched_keywords(raw_text, strong_hide_delete_keywords)
         sensitive_matches = get_sensitive_keyword_matches(event)
+        #Temporary bug fix to confirm keywords are being pulled from the raw text in the right place. Remove later.
+        keyword_context_snippets = get_keyword_context(
+            str(event.get("raw", "")),
+            sensitive_matches,
+        )
 
         if not move_matches and not strong_matches:
             continue
@@ -314,6 +347,8 @@ def detect_hide_or_delete_rules(events):
 
         if strong_matches or (move_matches and sensitive_matches):
             severity = "high"
+        elif move_matches:
+            severity = "medium"
         else:
             severity = "low"
 
@@ -336,6 +371,11 @@ def detect_hide_or_delete_rules(events):
         if sensitive_matches:
             detail_parts.append(
                 f"Sensitive keyword(s): {', '.join(sorted(set(sensitive_matches)))}."
+            )
+        #Temporary bug fix to confirm keywords are being pulled from the raw text in the right place. Remove later.
+        if keyword_context_snippets:
+            detail_parts.append(
+                f"Keyword context: {' | '.join(keyword_context_snippets[:3])}."
             )
 
         alerts.append({
