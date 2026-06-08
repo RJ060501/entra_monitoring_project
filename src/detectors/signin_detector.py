@@ -12,6 +12,8 @@ It currently detects:
 
 from config.settings import SUPPRESSED_USERS
 
+from collections import defaultdict
+
 
 def detect_signin_events(events):
     """
@@ -126,5 +128,75 @@ def detect_failed_then_success(events):
 
                 # Reset the failure list after reporting an alert.
                 failures_before_success = []
+
+    return alerts
+
+def detect_new_location_burst(events):
+    """
+    Detect repeated successful sign-ins from new locations.
+
+    This is stronger than a single new-location alert.
+
+    Severity logic:
+    - 3+ successful new-location sign-ins for same user = medium
+    - 2+ distinct new locations or 2+ distinct IPs = high
+    """
+    alerts = []
+    events_by_user = defaultdict(list)
+
+    for event in events:
+        user = event.get("user", "Unknown")
+
+        if user in SUPPRESSED_USERS:
+            continue
+
+        if event.get("status") != "success":
+            continue
+
+        if not event.get("new_location"):
+            continue
+
+        events_by_user[user].append(event)
+
+    for user, user_events in events_by_user.items():
+        if len(user_events) < 3:
+            continue
+
+        locations = {
+            event.get("location", "Unknown")
+            for event in user_events
+        }
+
+        ip_addresses = {
+            event.get("ip_address", "Unknown")
+            for event in user_events
+        }
+
+        apps = {
+            event.get("app_display_name", "Unknown")
+            for event in user_events
+        }
+
+        if len(locations) >= 2 or len(ip_addresses) >= 2:
+            severity = "high"
+            reason = "multiple new locations or IP addresses"
+        else:
+            severity = "medium"
+            reason = "repeated successful sign-ins from a new location"
+
+        alerts.append({
+            "severity": severity,
+            "type": "New Location Sign-in Burst",
+            "user": user,
+            "detail": (
+                f"{len(user_events)} successful sign-in(s) from new location activity. "
+                f"Reason: {reason}. "
+                f"Locations: {', '.join(sorted(locations))}. "
+                f"IP address(es): {', '.join(sorted(ip_addresses))}. "
+                f"Apps: {', '.join(sorted(apps))}."
+            ),
+            "location": ", ".join(sorted(locations)),
+            "source": "Entra Sign-In Logs",
+        })
 
     return alerts

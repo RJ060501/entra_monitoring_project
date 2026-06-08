@@ -74,6 +74,15 @@ HIDE_OR_DELETE_KEYWORDS = [
     "junk",
     "markasread",
     "move",
+    "mark as read",
+    "mark as junk",
+    "delete",
+    "move to folder",
+    "movetofolder",
+    "MarkAsRead",
+    "MarkAsJunk",
+    "DeleteMessage",
+    "MoveToFolder"
 ]
 
 

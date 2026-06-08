@@ -9,13 +9,17 @@ This file ties together the full monitoring pipeline:
    - Microsoft Entra sign-in logs
    - Microsoft Entra directory audit logs
    - Microsoft 365 / Exchange audit logs
-4. Filter down to only new events
-5. Run individual detectors
-6. Run correlation detectors
-7. Deduplicate alerts
-8. Send alerts to console and Microsoft Teams
-9. Save updated state
-10. Save/update the suspicious sign-in cache for future correlation
+4. Apply location baseline context
+5. Filter down to only new events
+6. Load rolling caches used for cross-run correlation
+7. Run individual detectors
+8. Run cross-run / cross-source correlation detectors
+9. Deduplicate alerts
+10. Save readable medium/high/critical alert history
+11. Send alerts to console and Microsoft Teams
+12. Save updated state
+13. Update location baseline
+14. Update rolling caches
 
 Important:
 - This script performs one monitoring run and then exits.
@@ -42,15 +46,27 @@ from core.correlation_cache import (
     save_suspicious_signin_cache,
     add_suspicious_signins_to_cache,
 )
-
 from core.location_baseline import (
     load_location_baseline,
     save_location_baseline,
     apply_location_baseline,
     update_location_baseline,
 )
+from core.alert_history import (
+    load_alert_history,
+    save_alert_history,
+    add_alerts_to_history,
+)
+from core.new_location_cache import (
+    load_new_location_cache,
+    save_new_location_cache,
+    add_new_location_events_to_cache,
+)
 
-from detectors.signin_detector import detect_signin_events
+from detectors.signin_detector import (
+    detect_signin_events,
+    detect_new_location_burst,
+)
 from detectors.audit_detector import detect_audit_events
 from detectors.email_detector import detect_email_events
 from detectors.correlation_detector import (
@@ -103,9 +119,10 @@ def main():
     signins = entra_client.get_signins()
     audits = entra_client.get_audits()
     email_events = m365_client.get_email_audit_events()
-    
-    #Load known sign-in Locations per user.
+
+    # Load known sign-in locations per user.
     location_baseline = load_location_baseline()
+
     # Apply new_location flags before detections run.
     signins = apply_location_baseline(signins, location_baseline)
 
@@ -125,12 +142,19 @@ def main():
         state.get("processed_email_event_ids", []),
     )
 
-    # Load suspicious sign-ins from previous runs.
-    # This allows correlation across time, not just within the current run.
+    # Load rolling suspicious sign-in cache.
+    # This allows mailbox-rule correlation across runs.
     cached_suspicious_signins = load_suspicious_signin_cache()
 
-    # Identify suspicious sign-ins from this run and add them to cache later.
+    # Load rolling new-location activity cache.
+    # This allows new-location burst detection across runs.
+    cached_new_location_events = load_new_location_cache()
+
+    # Identify suspicious sign-ins from this run for future correlation.
     new_suspicious_signins = get_suspicious_signins(new_signins)
+
+    # Combine cached and new new-location activity for cross-run burst detection.
+    combined_new_location_events = cached_new_location_events + new_signins
 
     # Print/log run summary.
     print_email_operation_summary(new_email_events)
@@ -146,6 +170,7 @@ def main():
     # Run detectors.
     alerts = []
     alerts += detect_signin_events(new_signins)
+    alerts += detect_new_location_burst(combined_new_location_events)
     alerts += detect_audit_events(new_audits)
     alerts += detect_email_events(new_email_events)
 
@@ -156,10 +181,20 @@ def main():
         cached_signins=cached_suspicious_signins,
     )
 
-    # Remove duplicate alerts from this run.
+    # Remove duplicate or near-duplicate alerts from this run.
     alerts = deduplicate_alerts(alerts)
 
     logger.info(f"Alert count: {len(alerts)}")
+
+    # Save readable medium/high/critical alert history.
+    alert_history = load_alert_history()
+
+    alert_history = add_alerts_to_history(
+        existing_history=alert_history,
+        alerts=alerts,
+    )
+
+    save_alert_history(alert_history)
 
     # Send alerts.
     send_console_alerts(alerts)
@@ -185,8 +220,8 @@ def main():
     )
 
     save_state(state)
-    
-    # Update location baseline with latest successful sign-ins.
+
+    # Update location baseline with latest sign-ins.
     location_baseline = update_location_baseline(
         signins,
         location_baseline,
@@ -194,13 +229,21 @@ def main():
 
     save_location_baseline(location_baseline)
 
-    # Update rolling suspicious sign-in cache for future correlation.
-    updated_cache = add_suspicious_signins_to_cache(
+    # Update rolling suspicious sign-in cache for future mailbox correlation.
+    updated_suspicious_signin_cache = add_suspicious_signins_to_cache(
         existing_events=cached_suspicious_signins,
         new_events=new_suspicious_signins,
     )
 
-    save_suspicious_signin_cache(updated_cache)
+    save_suspicious_signin_cache(updated_suspicious_signin_cache)
+
+    # Update rolling new-location cache for future burst detection.
+    updated_new_location_cache = add_new_location_events_to_cache(
+        existing_cache=cached_new_location_events,
+        events=new_signins,
+    )
+
+    save_new_location_cache(updated_new_location_cache)
 
     logger.info("Finished Entra monitoring run.")
 
