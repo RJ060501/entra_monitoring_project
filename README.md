@@ -104,15 +104,18 @@ python3 src/main.py
 # Tests
 
 Send a manual Teams test alert:
-
 ```bash
 PYTHONPATH=src python3 src/tests/send_test_alert.py
 ```
 
 Temporary alert test
-
 ```bash
 PYTHONPATH=src python3 src/tests/test_christopher_signin_detection.py
+```
+
+Test new location burst
+```bash
+PYTHONPATH=src python3 src/tests/test_new_location_burst.py
 ```
 
 ---

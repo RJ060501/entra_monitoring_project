@@ -10,8 +10,14 @@ Why this exists:
 - Repeated successful sign-ins from new locations, especially multiple cities/IPs,
   is more suspicious and should be visible in Teams.
 
-This cache lets us detect new-location bursts across time instead of only inside
-the current batch of events.
+Production behavior:
+- Keep recent new-location success events for 120 minutes.
+- This gives enough cross-run memory without keeping stale travel/VPN context.
+
+Test behavior:
+- Tests can pass a reference_time based on historical exported events.
+- This lets us test old incidents without increasing the real production cache
+  window to days or weeks.
 """
 
 import json
@@ -24,18 +30,28 @@ STATE_DIR = PROJECT_ROOT / "state"
 CACHE_FILE = STATE_DIR / "new_location_activity_cache.json"
 
 
+# Production cache window.
+# This should stay relatively short because this cache is for burst detection,
+# not long-term investigation history.
 CACHE_WINDOW_MINUTES = 120
 
 
 def parse_datetime(value):
     """
-    Parse a Microsoft Graph timestamp into a UTC datetime.
+    Parse a Microsoft Graph timestamp into a timezone-aware UTC datetime.
+
+    Microsoft APIs commonly return timestamps like:
+    - 2026-06-02T12:30:38Z
+    - 2026-06-02T12:30:38+00:00
+    - 2026-06-02T12:30:38
+
+    This function normalizes all valid values to UTC.
     """
     if not value:
         return None
 
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
@@ -44,6 +60,34 @@ def parse_datetime(value):
 
     except Exception:
         return None
+
+
+def get_reference_time(reference_time=None):
+    """
+    Return the time used for pruning cache entries.
+
+    Production:
+        reference_time is None, so use current UTC time.
+
+    Tests:
+        reference_time can be passed based on exported event timestamps.
+        This prevents historical test data from being immediately pruned.
+    """
+    if reference_time is None:
+        return datetime.now(timezone.utc)
+
+    if isinstance(reference_time, datetime):
+        if reference_time.tzinfo is None:
+            reference_time = reference_time.replace(tzinfo=timezone.utc)
+
+        return reference_time.astimezone(timezone.utc)
+
+    parsed = parse_datetime(reference_time)
+
+    if parsed:
+        return parsed
+
+    return datetime.now(timezone.utc)
 
 
 def load_new_location_cache():
@@ -79,12 +123,25 @@ def save_new_location_cache(cache):
         json.dump(cache, file, indent=2)
 
 
-def prune_new_location_cache(cache, window_minutes=CACHE_WINDOW_MINUTES):
+def prune_new_location_cache(
+    cache,
+    window_minutes=CACHE_WINDOW_MINUTES,
+    reference_time=None,
+):
     """
-    Keep only recent cached events.
+    Keep only cache entries within the rolling window.
+
+    window_minutes:
+        How long events remain in cache.
+
+    reference_time:
+        The timestamp to compare against.
+
+        Production should leave this as None.
+        Tests can provide a historical timestamp from exported events.
     """
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(minutes=window_minutes)
+    reference_datetime = get_reference_time(reference_time)
+    cutoff = reference_datetime - timedelta(minutes=window_minutes)
 
     pruned = []
 
@@ -103,6 +160,9 @@ def prune_new_location_cache(cache, window_minutes=CACHE_WINDOW_MINUTES):
 def build_cache_event(event):
     """
     Store only the fields needed for burst detection.
+
+    We intentionally do not store the full raw sign-in event here because this
+    cache is operational detection memory, not full forensic history.
     """
     return {
         "id": event.get("id"),
@@ -116,11 +176,33 @@ def build_cache_event(event):
     }
 
 
-def add_new_location_events_to_cache(existing_cache, events):
+def add_new_location_events_to_cache(
+    existing_cache,
+    events,
+    window_minutes=CACHE_WINDOW_MINUTES,
+    reference_time=None,
+):
     """
-    Add successful new-location sign-ins to cache.
+    Add successful new-location sign-ins to the rolling cache.
+
+    Only these events are cached:
+    - status == success
+    - new_location == True
+    - event has an ID
+    - event ID is not already cached
+
+    Production:
+        Use default window_minutes and reference_time.
+
+    Tests:
+        Pass reference_time based on exported event timestamps so old test data
+        is not immediately pruned.
     """
-    updated_cache = prune_new_location_cache(existing_cache)
+    updated_cache = prune_new_location_cache(
+        existing_cache,
+        window_minutes=window_minutes,
+        reference_time=reference_time,
+    )
 
     existing_ids = {
         event.get("id")
@@ -137,10 +219,17 @@ def add_new_location_events_to_cache(existing_cache, events):
 
         event_id = event.get("id")
 
-        if not event_id or event_id in existing_ids:
+        if not event_id:
+            continue
+
+        if event_id in existing_ids:
             continue
 
         updated_cache.append(build_cache_event(event))
         existing_ids.add(event_id)
 
-    return prune_new_location_cache(updated_cache)
+    return prune_new_location_cache(
+        updated_cache,
+        window_minutes=window_minutes,
+        reference_time=reference_time,
+    )
