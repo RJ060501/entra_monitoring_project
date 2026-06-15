@@ -11,7 +11,7 @@ This file ties together the full monitoring pipeline:
    - Microsoft 365 / Exchange audit logs
 4. Apply location baseline context
 5. Filter down to only new events
-6. Load rolling caches used for cross-run correlation
+6. Load rolling caches used for cross-run detection and correlation
 7. Run individual detectors
 8. Run cross-run / cross-source correlation detectors
 9. Deduplicate alerts
@@ -24,6 +24,7 @@ This file ties together the full monitoring pipeline:
 Important:
 - This script performs one monitoring run and then exits.
 - It is intended to be executed every 15 minutes by systemd.
+- Rolling caches are used because suspicious behavior may span multiple runs.
 """
 
 from collections import Counter
@@ -62,6 +63,11 @@ from core.new_location_cache import (
     save_new_location_cache,
     add_new_location_events_to_cache,
 )
+from core.mailbox_activity_cache import (
+    load_mailbox_activity_cache,
+    save_mailbox_activity_cache,
+    add_mailbox_activity_events_to_cache,
+)
 
 from detectors.signin_detector import (
     detect_signin_events,
@@ -84,6 +90,8 @@ def print_email_operation_summary(email_events):
 
     This is useful while tuning detections because it shows what types of
     mailbox events are actually appearing in your tenant.
+
+    This function is informational only. It does not affect detections.
     """
     operation_counts = Counter(
         event.get("operation", "Unknown")
@@ -107,11 +115,11 @@ def main():
     logger = setup_logger()
     logger.info("Starting Entra monitoring run.")
 
-    # Load settings and persistent state.
+    # Load configuration and persistent processing state.
     settings = load_settings()
     state = load_state()
 
-    # Initialize API clients.
+    # Initialize Microsoft API clients.
     entra_client = EntraClient(settings)
     m365_client = M365AuditClient(settings)
 
@@ -124,36 +132,45 @@ def main():
     location_baseline = load_location_baseline()
 
     # Apply new_location flags before detections run.
-    signins = apply_location_baseline(signins, location_baseline)
+    signins = apply_location_baseline(
+        events=signins,
+        baseline=location_baseline,
+    )
 
     # Filter out events that were already processed in previous runs.
     new_signins = filter_new_events(
-        signins,
-        state.get("processed_signin_ids", []),
+        events=signins,
+        processed_ids=state.get("processed_signin_ids", []),
     )
 
     new_audits = filter_new_events(
-        audits,
-        state.get("processed_audit_ids", []),
+        events=audits,
+        processed_ids=state.get("processed_audit_ids", []),
     )
 
     new_email_events = filter_new_events(
-        email_events,
-        state.get("processed_email_event_ids", []),
+        events=email_events,
+        processed_ids=state.get("processed_email_event_ids", []),
     )
 
-    # Load rolling suspicious sign-in cache.
-    # This allows mailbox-rule correlation across runs.
+    # Load rolling caches.
+    #
+    # These caches solve the 15-minute run-window problem:
+    # suspicious behavior may be split across scheduled runs.
     cached_suspicious_signins = load_suspicious_signin_cache()
-
-    # Load rolling new-location activity cache.
-    # This allows new-location burst detection across runs.
     cached_new_location_events = load_new_location_cache()
+    cached_mailbox_activity_events = load_mailbox_activity_cache()
+    cached_failed_signins = load_failed_signin_cache()
 
-    # Identify suspicious sign-ins from this run for future correlation.
+    # Identify suspicious sign-ins from this run for future mailbox correlation.
     new_suspicious_signins = get_suspicious_signins(new_signins)
 
-    # Combine cached and new new-location activity for cross-run burst detection.
+    # Combine cached and new new-location events for cross-run burst detection.
+    #
+    # This allows:
+    # Run 1: several new-location successes
+    # Run 2: more new-location successes
+    # Alert: New Location Sign-in Burst
     combined_new_location_events = cached_new_location_events + new_signins
 
     # Print/log run summary.
@@ -167,26 +184,61 @@ def main():
     logger.info(f"New audit event(s): {len(new_audits)}")
     logger.info(f"New email audit event(s): {len(new_email_events)}")
 
-    # Run detectors.
+    # Run single-source detectors.
     alerts = []
-    alerts += detect_signin_events(new_signins)
+    alerts += detect_signin_events(
+        events=new_signins,
+        cached_failed_signins=cached_failed_signins,
+    )
     alerts += detect_new_location_burst(combined_new_location_events)
     alerts += detect_audit_events(new_audits)
     alerts += detect_email_events(new_email_events)
 
-    # Run correlation detector using both current and cached suspicious sign-ins.
+    # Correlation pass 1:
+    # Cached suspicious sign-ins + new mailbox activity.
+    #
+    # This handles:
+    # Run 1: suspicious sign-in
+    # Run 2: mailbox rule / forwarding / hide-delete activity
     alerts += detect_correlations(
         signin_events=new_signins,
         email_events=new_email_events,
         cached_signins=cached_suspicious_signins,
     )
 
+    # Correlation pass 2:
+    # New suspicious sign-ins + cached mailbox activity.
+    #
+    # This handles the reverse order:
+    # Run 1: mailbox rule / forwarding / hide-delete activity
+    # Run 2: suspicious sign-in
+    #
+    # Important:
+    # We intentionally do not pass cached_signins here.
+    # That prevents cached sign-ins from correlating with cached mailbox events
+    # repeatedly on every run.
+    alerts += detect_correlations(
+        signin_events=new_signins,
+        email_events=[],
+        cached_email_events=cached_mailbox_activity_events,
+    )
+
     # Remove duplicate or near-duplicate alerts from this run.
     alerts = deduplicate_alerts(alerts)
-
+    
+    failed_cache_clear_users = {
+        alert.get("cache_clear_user")
+        for alert in alerts
+        if alert.get("cache_clear_user")
+    }
+    
     logger.info(f"Alert count: {len(alerts)}")
 
     # Save readable medium/high/critical alert history.
+    #
+    # This is separate from state.json.
+    # state.json prevents duplicate processing.
+    # security_alert_history.json is for review and investigation.
     alert_history = load_alert_history()
 
     alert_history = add_alerts_to_history(
@@ -196,40 +248,50 @@ def main():
 
     save_alert_history(alert_history)
 
-    # Send alerts.
+    # Send alerts to console and Teams.
+    #
+    # The Teams notifier filters out low severity alerts.
     send_console_alerts(alerts)
     send_teams_alerts(alerts, settings)
 
-    # Mark current events as processed so they are not alerted on again.
+    # Mark current events as processed so they are not processed again.
     state = mark_events_processed(
-        state,
-        "processed_signin_ids",
-        new_signins,
+        state=state,
+        key="processed_signin_ids",
+        events=new_signins,
     )
 
     state = mark_events_processed(
-        state,
-        "processed_audit_ids",
-        new_audits,
+        state=state,
+        key="processed_audit_ids",
+        events=new_audits,
     )
 
     state = mark_events_processed(
-        state,
-        "processed_email_event_ids",
-        new_email_events,
+        state=state,
+        key="processed_email_event_ids",
+        events=new_email_events,
     )
 
     save_state(state)
 
     # Update location baseline with latest sign-ins.
+    #
+    # Note:
+    # This currently uses all sign-ins. Later, we may want to update baseline
+    # only from trusted/successful/low-risk sign-ins to avoid learning attacker
+    # locations too quickly.
     location_baseline = update_location_baseline(
-        signins,
-        location_baseline,
+        events=signins,
+        baseline=location_baseline,
     )
 
     save_location_baseline(location_baseline)
 
-    # Update rolling suspicious sign-in cache for future mailbox correlation.
+    # Update rolling suspicious sign-in cache.
+    #
+    # This lets future mailbox activity correlate with suspicious sign-ins from
+    # previous monitoring runs.
     updated_suspicious_signin_cache = add_suspicious_signins_to_cache(
         existing_events=cached_suspicious_signins,
         new_events=new_suspicious_signins,
@@ -237,13 +299,39 @@ def main():
 
     save_suspicious_signin_cache(updated_suspicious_signin_cache)
 
-    # Update rolling new-location cache for future burst detection.
+    # Update rolling new-location activity cache.
+    #
+    # This lets future runs detect repeated new-location activity that spans
+    # multiple scheduled runs.
     updated_new_location_cache = add_new_location_events_to_cache(
         existing_cache=cached_new_location_events,
         events=new_signins,
     )
 
     save_new_location_cache(updated_new_location_cache)
+
+    # Update rolling mailbox activity cache.
+    #
+    # This lets future suspicious sign-ins correlate with mailbox activity from
+    # previous monitoring runs.
+    updated_mailbox_activity_cache = add_mailbox_activity_events_to_cache(
+        existing_cache=cached_mailbox_activity_events,
+        events=new_email_events,
+    )
+
+    save_mailbox_activity_cache(updated_mailbox_activity_cache)
+    
+    updated_failed_signin_cache = add_failed_signins_to_cache(
+        existing_cache=cached_failed_signins,
+        events=new_signins,
+    )
+
+    updated_failed_signin_cache = clear_failed_signins_for_users(
+        cache=updated_failed_signin_cache,
+        users=failed_cache_clear_users,
+    )
+
+    save_failed_signin_cache(updated_failed_signin_cache)
 
     logger.info("Finished Entra monitoring run.")
 

@@ -327,7 +327,12 @@ def detect_signin_email_correlation(signin_events, email_events):
     return alerts
 
 
-def detect_correlations(signin_events, email_events, cached_signins=None):
+def detect_correlations(
+    signin_events,
+    email_events,
+    cached_signins=None,
+    cached_email_events=None,
+):
     """
     Main correlation detector entry point.
 
@@ -339,16 +344,33 @@ def detect_correlations(signin_events, email_events, cached_signins=None):
 
     cached_signins:
         Suspicious sign-ins from previous runs.
+
+    cached_email_events:
+        Mailbox rule / forwarding / hide-delete activity from previous runs.
+
+    Important:
+        Be careful how this function is called from main.py.
+
+        To avoid repeated cached-to-cached alerts every run, main.py should
+        usually call this in two passes:
+
+        1. cached suspicious sign-ins + new email events
+        2. new sign-ins + cached mailbox events
+
+        Avoid combining cached sign-ins and cached mailbox events in the same
+        call unless you also add pair-level deduplication.
     """
     alerts = []
 
     cached_signins = cached_signins or []
+    cached_email_events = cached_email_events or []
 
     combined_signins = cached_signins + signin_events
+    combined_email_events = cached_email_events + email_events
 
     alerts += detect_signin_email_correlation(
         signin_events=combined_signins,
-        email_events=email_events,
+        email_events=combined_email_events,
     )
 
     return alerts

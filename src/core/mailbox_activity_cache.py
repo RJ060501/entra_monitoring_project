@@ -213,12 +213,14 @@ def add_mailbox_activity_events_to_cache(
         Optionally pass reference_time so historical exported events are not
         immediately pruned.
     """
+    # Remove old entries from the existing cache before adding new events.
     updated_cache = prune_mailbox_activity_cache(
         existing_cache,
         window_minutes=window_minutes,
         reference_time=reference_time,
     )
 
+    # Build a set of IDs already present in the cache so we can deduplicate.
     existing_ids = {
         event.get("id")
         for event in updated_cache
@@ -226,20 +228,25 @@ def add_mailbox_activity_events_to_cache(
     }
 
     for event in events:
+        # Ignore events that are not mailbox configuration operations we care about.
         if not is_cacheable_mailbox_activity(event):
             continue
 
         event_id = event.get("id")
 
+        # Skip events with no identifier; we cannot deduplicate them safely.
         if not event_id:
             continue
 
+        # Skip duplicates already present in the cache.
         if event_id in existing_ids:
             continue
 
         updated_cache.append(build_cache_event(event))
         existing_ids.add(event_id)
 
+    # After adding new events, prune again and return only entries still within
+    # the allowed retention window.
     return prune_mailbox_activity_cache(
         updated_cache,
         window_minutes=window_minutes,
