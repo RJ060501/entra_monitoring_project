@@ -11,7 +11,11 @@ It currently detects:
 """
 
 from config.settings import SUPPRESSED_USERS
-
+from core.security_constants import (
+    MAILBOX_CONFIGURATION_OPERATIONS,
+    SUSPICIOUS_SIGNIN_TEXT_INDICATORS,
+    RISKY_SIGNIN_LEVELS,
+)
 from collections import defaultdict
 
 
@@ -154,11 +158,12 @@ def detect_failed_then_success(events, cached_failed_signins=None):
 
             latest_failure = failures_before_success[-1]
 
-            # Severity logic:
-            # - 3+ failures followed by success = medium
-            # - 5+ failures followed by success = high
-            # - success from new location = high
-            if failure_count >= 5 or event.get("new_location"):
+            # Why:
+            # Repeated Microsoft sign-in failures can happen during normal
+            # prompts such as "Keep me signed in", expired passwords, or MFA
+            # registration. Those should be visible, but should only become
+            # HIGH when the eventual success happens from a new location.
+            if event.get("new_location"):
                 severity = "high"
             else:
                 severity = "medium"
@@ -175,7 +180,6 @@ def detect_failed_then_success(events, cached_failed_signins=None):
                 ),
                 "location": event.get("location", "Unknown"),
                 "source": "Entra Sign-In Logs",
-                # Internal metadata used by main.py to clear cache after alerting.
                 "cache_clear_user": user,
             })
 
@@ -185,18 +189,62 @@ def detect_failed_then_success(events, cached_failed_signins=None):
 
     return alerts
 
-def detect_new_location_burst(events):
+def detect_new_location_burst(
+    events,
+    failed_signin_events=None,
+    mailbox_events=None,
+):
     """
     Detect repeated successful sign-ins from new locations.
 
-    This is stronger than a single new-location alert.
+    This detector is context-aware but still intentionally simple.
+
+    It does not replace the dedicated detectors for:
+    - failed sign-ins followed by success
+    - mailbox rules
+    - forwarding
+    - hide/delete rules
+    - sign-in/mailbox correlation
+
+    Instead, it uses nearby context to decide whether a new-location burst is
+    just LOW context or should be Teams-visible.
 
     Severity logic:
-    - 3+ successful new-location sign-ins for same user = medium
-    - 2+ distinct new locations or 2+ distinct IPs = high
+
+    LOW:
+    - 3+ successful new-location sign-ins
+    - same user
+    - same location
+    - same IP
+    - no failed sign-in context
+    - no mailbox activity context
+    - no suspicious client/risk context
+
+    MEDIUM:
+    - same location/IP burst, but high volume
+    - OR same location/IP burst with failed sign-in context
+    - OR same location/IP burst with suspicious client/risk context
+
+    HIGH:
+    - burst from multiple new locations
+    - OR burst from multiple IP addresses
+    - OR burst paired with mailbox activity context
+
+    Why:
+    Microsoft 365 often creates several successful sign-ins close together from
+    normal apps such as Office, SharePoint, Teams, OneDrive, and Outlook.
+    That should not page Teams by itself.
+
+    But when new-location burst activity overlaps with failures, mailbox rule
+    activity, suspicious client behavior, or multiple IPs/locations, it becomes
+    much more useful as a security alert.
     """
     alerts = []
-    events_by_user = defaultdict(list)
+
+    failed_signin_events = failed_signin_events or []
+    mailbox_events = mailbox_events or []
+
+    events_by_user = {}
 
     for event in events:
         user = event.get("user", "Unknown")
@@ -210,11 +258,25 @@ def detect_new_location_burst(events):
         if not event.get("new_location"):
             continue
 
-        events_by_user[user].append(event)
+        events_by_user.setdefault(user, []).append(event)
+
+    failed_users = {
+        str(event.get("user", "")).lower().strip()
+        for event in failed_signin_events
+        if event.get("status") == "failure"
+    }
+
+    mailbox_context_users = {
+        str(event.get("user", "")).lower().strip()
+        for event in mailbox_events
+        if event.get("operation") in MAILBOX_CONFIGURATION_OPERATIONS
+    }
 
     for user, user_events in events_by_user.items():
         if len(user_events) < 3:
             continue
+
+        normalized_user = str(user).lower().strip()
 
         locations = {
             event.get("location", "Unknown")
@@ -231,19 +293,44 @@ def detect_new_location_burst(events):
             for event in user_events
         }
 
-        if len(locations) >= 2 or len(ip_addresses) >= 2:
+        event_count = len(user_events)
+        location_count = len(locations)
+        ip_count = len(ip_addresses)
+
+        has_failed_context = normalized_user in failed_users
+        has_mailbox_context = normalized_user in mailbox_context_users
+        has_suspicious_context = has_suspicious_signin_context(user_events)
+
+        if has_mailbox_context:
+            severity = "high"
+            reason = "new-location burst paired with mailbox activity"
+
+        elif location_count >= 2 or ip_count >= 2:
             severity = "high"
             reason = "multiple new locations or IP addresses"
-        else:
+
+        elif has_suspicious_context:
             severity = "medium"
-            reason = "repeated successful sign-ins from a new location"
+            reason = "new-location burst paired with suspicious sign-in context"
+
+        elif has_failed_context:
+            severity = "medium"
+            reason = "new-location burst paired with failed sign-in context"
+
+        elif event_count >= 6:
+            severity = "medium"
+            reason = "high volume of successful sign-ins from one new location"
+
+        else:
+            severity = "low"
+            reason = "repeated successful sign-ins from one new location and one IP"
 
         alerts.append({
             "severity": severity,
             "type": "New Location Sign-in Burst",
             "user": user,
             "detail": (
-                f"{len(user_events)} successful sign-in(s) from new location activity. "
+                f"{event_count} successful sign-in(s) from new location activity. "
                 f"Reason: {reason}. "
                 f"Locations: {', '.join(sorted(locations))}. "
                 f"IP address(es): {', '.join(sorted(ip_addresses))}. "
@@ -254,3 +341,54 @@ def detect_new_location_burst(events):
         })
 
     return alerts
+
+def has_suspicious_signin_context(events):
+    """
+    Return True if any sign-in event has suspicious client or risk context.
+
+    This is intentionally conservative.
+
+    Current signals:
+    - Python Requests / automation-style user agent
+    - device code flow
+    - medium/high risk level
+    - conditional access failure
+    - risky sign-in details present
+
+    This helps elevate single-IP new-location bursts when the sign-in itself has
+    stronger compromise indicators.
+    """
+
+    for event in events:
+        raw_text = str(event.get("raw", "")).lower()
+
+        for indicator in SUSPICIOUS_SIGNIN_TEXT_INDICATORS:
+            if indicator in raw_text:
+                return True
+
+        risk_level = str(
+            event.get("risk_level_aggregated")
+            or event.get("risk_level")
+            or ""
+        ).lower()
+
+        if risk_level in RISKY_SIGNIN_LEVELS:
+            return True
+
+        conditional_access_status = str(
+            event.get("conditional_access_status", "")
+        ).lower()
+
+        if conditional_access_status == "failure":
+            return True
+
+        risk_detail = str(event.get("risk_detail", "")).lower()
+
+        if risk_detail and risk_detail not in {
+            "none",
+            "hidden",
+            "unknown",
+        }:
+            return True
+
+    return False

@@ -27,6 +27,7 @@ alerts should still be stored in security_alert_history.json.
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from core.security_constants import MAILBOX_CONFIGURATION_OPERATIONS
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,15 +39,6 @@ CACHE_FILE = STATE_DIR / "mailbox_activity_cache.json"
 # This is long enough to handle Microsoft audit delays and cross-run correlation,
 # but short enough to avoid stale mailbox activity causing noisy alerts.
 CACHE_WINDOW_MINUTES = 1440
-
-
-MAILBOX_ACTIVITY_OPERATIONS = {
-    "New-InboxRule",
-    "Set-InboxRule",
-    "Remove-InboxRule",
-    "Set-Mailbox",
-}
-
 
 def parse_datetime(value):
     """
@@ -173,7 +165,7 @@ def is_cacheable_mailbox_activity(event):
     """
     operation = event.get("operation", "")
 
-    return operation in MAILBOX_ACTIVITY_OPERATIONS
+    return operation in MAILBOX_CONFIGURATION_OPERATIONS
 
 
 def build_cache_event(event):

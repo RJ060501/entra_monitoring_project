@@ -69,6 +69,13 @@ from core.mailbox_activity_cache import (
     add_mailbox_activity_events_to_cache,
 )
 
+from core.failed_signin_cache import (
+    load_failed_signin_cache,
+    save_failed_signin_cache,
+    add_failed_signins_to_cache,
+    clear_failed_signins_for_users,
+)
+
 from detectors.signin_detector import (
     detect_signin_events,
     detect_new_location_burst,
@@ -190,7 +197,13 @@ def main():
         events=new_signins,
         cached_failed_signins=cached_failed_signins,
     )
-    alerts += detect_new_location_burst(combined_new_location_events)
+
+    alerts += detect_new_location_burst(
+        events=combined_new_location_events,
+        failed_signin_events=cached_failed_signins + new_signins,
+        mailbox_events=cached_mailbox_activity_events + new_email_events,
+    )
+
     alerts += detect_audit_events(new_audits)
     alerts += detect_email_events(new_email_events)
 

@@ -15,76 +15,12 @@ Current focus:
 import re
 
 from config.settings import SUPPRESSED_USERS, INTERNAL_DOMAINS
-
-
-# Mailbox and transport rule operations we care about.
-SUSPICIOUS_EMAIL_OPERATIONS = {
-    "New-InboxRule",
-    "Set-InboxRule",
-    "Remove-InboxRule",
-    "Set-Mailbox",
-    "New-TransportRule",
-    "Set-TransportRule",
-}
-
-
-# Forwarding/redirect fields commonly seen in Exchange audit payloads.
-FORWARDING_KEYWORDS = [
-    "forward",
-    "forwardto",
-    "forwardasattachmentto",
-    "redirectto",
-    "delivertomailboxandforward",
-    "forwardingaddress",
-    "forwardingsmtpaddress",
-]
-
-
-# Keywords tied to your common business/email compromise patterns.
-SENSITIVE_KEYWORDS = [
-    "mfa",
-    "password",
-    "security",
-    "docusign",
-    "sharepoint",
-    "invoice",
-    "payroll",
-    "wire",
-    "teams",
-    "review",
-    "approval",
-    "urgent",
-    "contract",
-    "settlement",
-    "canvas",
-    "asap",
-    "payment",
-    "vendor",
-    "nda",
-    "approval",
-    "contract"
-]
-
-
-# Keywords that suggest rules are hiding, deleting, moving, or suppressing mail.
-HIDE_OR_DELETE_KEYWORDS = [
-    "deleted",
-    "archive",
-    "rss",
-    "junk",
-    "markasread",
-    "move",
-    "mark as read",
-    "mark as junk",
-    "delete",
-    "move to folder",
-    "movetofolder",
-    "MarkAsRead",
-    "MarkAsJunk",
-    "DeleteMessage",
-    "MoveToFolder"
-]
-
+from core.security_constants import (
+    MAILBOX_CONFIGURATION_OPERATIONS,
+    FORWARDING_KEYWORDS,
+    SENSITIVE_EMAIL_KEYWORDS,
+    HIDE_OR_DELETE_KEYWORDS,
+)
 
 def detect_email_events(events):
     """Run all email event detectors and return combined alerts."""
@@ -176,7 +112,7 @@ def matched_keywords(text, keywords):
 
 def is_rule_related_operation(operation):
     """Return True if the audit operation is related to mailbox/transport rules."""
-    return operation in SUSPICIOUS_EMAIL_OPERATIONS
+    return operation in MAILBOX_CONFIGURATION_OPERATIONS
 
 def get_sensitive_keyword_matches(event):
     """
@@ -187,7 +123,7 @@ def get_sensitive_keyword_matches(event):
     """
     raw_text = get_raw_text(event)
 
-    return matched_keywords(raw_text, SENSITIVE_KEYWORDS)
+    return matched_keywords(raw_text, SENSITIVE_EMAIL_KEYWORDS)
 
 # Use later for context and dashboard metrics
 def detect_mailbox_rule_changes(events):
@@ -320,14 +256,6 @@ def detect_hide_or_delete_rules(events):
     """
     alerts = []
 
-    strong_hide_delete_keywords = [
-        "deleted",
-        "archive",
-        "rss",
-        "junk",
-        "markasread",
-    ]
-
     for event in events:
         user = event.get("user", "Unknown")
 
@@ -341,7 +269,7 @@ def detect_hide_or_delete_rules(events):
             continue
 
         move_matches = matched_keywords(raw_text, ["move"])
-        strong_matches = matched_keywords(raw_text, strong_hide_delete_keywords)
+        strong_matches = matched_keywords(raw_text, HIDE_OR_DELETE_KEYWORDS)
         sensitive_matches = get_sensitive_keyword_matches(event)
         #Temporary bug fix to confirm keywords are being pulled from the raw text in the right place. Remove later.
         keyword_context_snippets = get_keyword_context(

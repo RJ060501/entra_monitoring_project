@@ -17,18 +17,11 @@ security_alert_history.json:
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-
+from core.security_constants import ALERT_SEVERITIES
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = PROJECT_ROOT / "state"
 ALERT_HISTORY_FILE = STATE_DIR / "security_alert_history.json"
-
-
-ALERT_HISTORY_SEVERITIES = {
-    "medium",
-    "high",
-    "critical",
-}
 
 
 def load_alert_history():
@@ -94,7 +87,7 @@ def add_alerts_to_history(existing_history, alerts, max_alerts=1000):
     for alert in alerts:
         severity = str(alert.get("severity", "")).lower()
 
-        if severity not in ALERT_HISTORY_SEVERITIES:
+        if severity not in ALERT_SEVERITIES:
             continue
 
         fingerprint = build_alert_fingerprint(alert)

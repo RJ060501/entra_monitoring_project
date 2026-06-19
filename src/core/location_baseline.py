@@ -16,11 +16,8 @@ This file stores simple per-user location baselines in:
 import json
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
 STATE_DIR = PROJECT_ROOT / "state"
-
 BASELINE_FILE = STATE_DIR / "location_baseline.json"
 
 
