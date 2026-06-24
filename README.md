@@ -120,6 +120,43 @@ PYTHONPATH=src python3 src/tests/test_new_location_burst.py
 
 ---
 
+# Clear Rolling Caches
+
+```bash
+cat > state/recent_suspicious_signins.json <<'EOF'
+[]
+EOF
+
+cat > state/new_location_activity_cache.json <<'EOF'
+[]
+EOF
+
+cat > state/mailbox_activity_cache.json <<'EOF'
+[]
+EOF
+
+cat > state/failed_signin_cache.json <<'EOF'
+[]
+EOF
+```
+
+# Verify:
+
+```bash
+for f in \
+  state/recent_suspicious_signins.json \
+  state/new_location_activity_cache.json \
+  state/mailbox_activity_cache.json \
+  state/failed_signin_cache.json
+do
+  echo "$f:"
+  cat "$f"
+  echo
+done
+```
+
+---
+
 # Useful Commands
 
 ## Service (Manual Run)

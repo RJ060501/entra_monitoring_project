@@ -76,6 +76,15 @@ from core.failed_signin_cache import (
     clear_failed_signins_for_users,
 )
 
+from core.run_summary import (
+    create_run_summary,
+    set_count,
+    add_error,
+    set_alert_summary,
+    finish_run_summary,
+    log_run_summary,
+)
+
 from detectors.signin_detector import (
     detect_signin_events,
     detect_new_location_burst,
@@ -121,6 +130,8 @@ def main():
     """
     logger = setup_logger()
     logger.info("Starting Entra monitoring run.")
+    run_summary = create_run_summary()
+    
 
     # Load configuration and persistent processing state.
     settings = load_settings()
@@ -134,6 +145,10 @@ def main():
     signins = entra_client.get_signins()
     audits = entra_client.get_audits()
     email_events = m365_client.get_email_audit_events()
+    
+    run_summary = set_count(run_summary, "fetched_signins", len(signins))
+    run_summary = set_count(run_summary, "fetched_audits", len(audits))
+    run_summary = set_count(run_summary, "fetched_email_events", len(email_events))
 
     # Load known sign-in locations per user.
     location_baseline = load_location_baseline()
@@ -159,6 +174,10 @@ def main():
         events=email_events,
         processed_ids=state.get("processed_email_event_ids", []),
     )
+    
+    run_summary = set_count(run_summary, "new_signins", len(new_signins))
+    run_summary = set_count(run_summary, "new_audits", len(new_audits))
+    run_summary = set_count(run_summary, "new_email_events", len(new_email_events))
 
     # Load rolling caches.
     #
@@ -238,6 +257,8 @@ def main():
 
     # Remove duplicate or near-duplicate alerts from this run.
     alerts = deduplicate_alerts(alerts)
+    
+    run_summary = set_alert_summary(run_summary, alerts)
     
     failed_cache_clear_users = {
         alert.get("cache_clear_user")
@@ -345,6 +366,9 @@ def main():
     )
 
     save_failed_signin_cache(updated_failed_signin_cache)
+
+    run_summary = finish_run_summary(run_summary)
+    log_run_summary(run_summary, logger)
 
     logger.info("Finished Entra monitoring run.")
 

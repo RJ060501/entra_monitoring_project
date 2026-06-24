@@ -119,17 +119,51 @@ class M365AuditClient:
         print(f"Fetched {len(content)} Exchange audit content blob(s).")
         return content
 
-    def download_content_blob(self, content_uri):
+    def download_content_blob(self, content_uri, max_retries=3):
         """
-        Download one audit content blob.
+        Download one Microsoft 365 audit content blob.
 
-        Each content URI points to a JSON payload containing one or more audit
-        records for a time slice. The raw JSON is returned for later parsing.
+        Microsoft audit content blobs can occasionally be slow, large, or
+        temporarily unavailable. A single blob timeout should not crash the entire
+        monitoring run.
+
+        Behavior:
+        - Retry timeout/transient request failures a few times.
+        - Increase timeout to 60 seconds.
+        - If the blob still cannot be downloaded, return an empty list.
+        - The next run can try again if Microsoft still returns the blob URI.
         """
-        response = requests.get(content_uri, headers=self._get_headers(), timeout=30)
-        self._raise_for_api_error(response)
+        import time
+        import requests
 
-        return response.json()
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.get(
+                    content_uri,
+                    headers=self._get_headers(),
+                    timeout=60,
+                )
+
+                response.raise_for_status()
+                return response.json()
+
+            except requests.exceptions.Timeout:
+                print(
+                    f"Timeout downloading Exchange audit blob "
+                    f"(attempt {attempt}/{max_retries})."
+                )
+
+            except requests.exceptions.RequestException as error:
+                print(
+                    f"Error downloading Exchange audit blob "
+                    f"(attempt {attempt}/{max_retries}): {error}"
+                )
+
+            if attempt < max_retries:
+                time.sleep(5 * attempt)
+
+        print("Skipping Exchange audit blob after repeated failures.")
+        return []
 
     def get_email_audit_events(self, lookback_minutes=60):
         """
