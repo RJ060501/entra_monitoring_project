@@ -3,7 +3,7 @@ Security Alert History
 
 Stores generated medium/high/critical alerts in a readable JSON file.
 
-This is separate from state.json.
+This is separate from state.json and cache files.
 
 state.json:
 - Tracks processed Microsoft event IDs
