@@ -317,10 +317,6 @@ def detect_new_location_burst(
             severity = "medium"
             reason = "new-location burst paired with failed sign-in context"
 
-        elif event_count >= 6:
-            severity = "medium"
-            reason = "high volume of successful sign-ins from one new location"
-
         else:
             severity = "low"
             reason = "repeated successful sign-ins from one new location and one IP"
