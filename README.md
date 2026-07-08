@@ -208,8 +208,6 @@ journalctl -u entra-monitor.timer --since "7 days ago" --no-pager
 systemctl is-enabled entra-monitor.timer
 systemctl is-active entra-monitor.timer
 systemctl list-timers --all | grep entra-monitor
-journalctl -u entra-monitor.service --since "7 days ago" --no-pager | grep "Starting Entra monitoring run"
-journalctl -u entra-monitor.timer --since "7 days ago" --no-pager
 ```
 
 ---

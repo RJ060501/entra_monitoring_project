@@ -85,6 +85,10 @@ from core.run_summary import (
     log_run_summary,
 )
 
+from core.alert_suppression import (
+    suppress_recent_alerts
+)
+
 from detectors.signin_detector import (
     detect_signin_events,
     detect_new_location_burst,
@@ -257,15 +261,25 @@ def main():
 
     # Remove duplicate or near-duplicate alerts from this run.
     alerts = deduplicate_alerts(alerts)
-    
-    run_summary = set_alert_summary(run_summary, alerts)
-    
+
+    # Keep the full detected alert list before cross-run suppression.
+    # Some detected alerts may carry cache cleanup metadata.
+    detected_alerts = alerts
+
     failed_cache_clear_users = {
         alert.get("cache_clear_user")
-        for alert in alerts
+        for alert in detected_alerts
         if alert.get("cache_clear_user")
     }
-    
+
+    # Suppress repeated Teams-worthy alerts across scheduled runs.
+    # This prevents rolling cache detections from sending the same alert every run.
+    alerts, suppressed_alerts = suppress_recent_alerts(alerts)
+
+    run_summary = set_alert_summary(run_summary, alerts)
+
+    logger.info(f"Detected alert count before suppression: {len(detected_alerts)}")
+    logger.info(f"Suppressed repeat alert count: {len(suppressed_alerts)}")
     logger.info(f"Alert count: {len(alerts)}")
 
     # Save readable medium/high/critical alert history.

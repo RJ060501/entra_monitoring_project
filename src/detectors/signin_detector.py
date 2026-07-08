@@ -42,28 +42,65 @@ def detect_signin_events(events, cached_failed_signins=None):
 
 
 def detect_unusual_login_time(events):
-    """Detect sign-ins that happen outside normal business hours."""
+    """
+    Detect sign-ins that happen outside normal business hours.
+
+    V1 tuning:
+    - Unusual login time by itself is LOW.
+    - Unusual login time from a new location is MEDIUM.
+    - Unusual login time with suspicious risk/client context is HIGH.
+
+    This keeps the signal available in console/history without spamming Teams
+    for normal after-hours Microsoft 365 activity.
+    """
     alerts = []
 
     for event in events:
-        user = event["user"]
+        user = str(event.get("user", "")).lower().strip()
+
+        if not user:
+            continue
 
         # Ignore users that are intentionally suppressed from alerting.
         if user in SUPPRESSED_USERS:
             continue
 
+        # Only alert on successful sign-ins.
+        if event.get("status") != "success":
+            continue
+
         hour = event.get("hour")
 
-        # Treat logins before 1 AM or after 4:59M as unusual.
-        if hour is not None and (1 <= hour <= 4):
-            alerts.append({
-                "severity": "medium",
-                "type": "Unusual Login Time",
-                "user": user,
-                "detail": f"Login at hour {hour} UTC",
-                "location": event.get("location", "Unknown"),
-                "source": "Entra Sign-In Logs",
-            })
+        # Treat sign-ins between 1:00 AM and 4:59 AM UTC as unusual.
+        if hour is None or not (1 <= hour <= 4):
+            continue
+
+        has_new_location = bool(event.get("new_location"))
+        has_suspicious_context = has_suspicious_signin_context([event])
+
+        if has_suspicious_context:
+            severity = "high"
+            reason = "unusual login time with suspicious sign-in context"
+        elif has_new_location:
+            severity = "medium"
+            reason = "unusual login time from a new location"
+        else:
+            severity = "low"
+            reason = "unusual login time only"
+
+        alerts.append({
+            "severity": severity,
+            "type": "Unusual Login Time",
+            "user": user,
+            "detail": (
+                f"Login at hour {hour} UTC. "
+                f"Reason: {reason}. "
+                f"App: {event.get('app_display_name', 'Unknown')}. "
+                f"IP: {event.get('ip_address', 'Unknown')}."
+            ),
+            "location": event.get("location", "Unknown"),
+            "source": "Entra Sign-In Logs",
+        })
 
     return alerts
 
