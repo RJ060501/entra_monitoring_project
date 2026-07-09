@@ -1,23 +1,24 @@
 """
 Correlation Detector
 
-Detects suspicious combinations of events across multiple data sources.
+This detector looks for suspicious combinations of activity across different
+Microsoft 365 data sources.
 
-Why correlation matters:
-- A suspicious sign-in alone may be noisy.
-- A mailbox rule alone may be legitimate.
-- But a suspicious sign-in near mailbox rule, forwarding, or hide/delete
-  activity is much more concerning and may indicate account compromise.
+The main V1 use case is:
 
-Current correlation logic:
-- Same user
-- Suspicious sign-in
-- Mailbox rule / forwarding / hide-delete event
-- Severity based on mailbox behavior and time distance
+1. Suspicious Entra sign-in activity
+2. Mailbox rule or forwarding activity
+3. Both events happening close enough together to suggest possible email
+   account compromise
 
-Important:
-This file does not decide whether a single sign-in or single mailbox event is
-bad by itself. It only correlates events that become more meaningful together.
+Why this matters:
+Attackers commonly create inbox rules after compromising a mailbox. These rules
+may hide, delete, move, mark-as-read, or forward security warnings and phishing
+replies.
+
+This file does not fetch data directly. It expects normalized events from:
+- Entra sign-in logs
+- Microsoft 365 / Exchange audit logs
 """
 
 from datetime import datetime, timezone
@@ -30,104 +31,106 @@ from core.security_constants import (
     SUSPICIOUS_SIGNIN_TEXT_INDICATORS,
 )
 
-
-CRITICAL_CORRELATION_WINDOW_MINUTES = 60
-HIGH_CONFIDENCE_CORRELATION_WINDOW_MINUTES = 1440
+from utils.time_utils import format_mountain_time
 
 
 def parse_datetime(value):
     """
-    Convert a Microsoft timestamp string into a timezone-aware UTC datetime.
+    Parse a Microsoft datetime value into a timezone-aware datetime object.
 
-    Microsoft APIs may return timestamps in slightly different formats:
-    - 2026-05-14T20:00:00Z
-    - 2026-05-14T20:00:00
-    - 2026-05-14T20:00:00+00:00
+    Microsoft timestamps are usually UTC and often end with Z.
 
-    Python cannot compare or subtract timezone-aware and timezone-naive
-    datetimes. This function normalizes everything to timezone-aware UTC.
+    Some normalized events may have timestamps without timezone information.
+    When that happens, we assume UTC because Microsoft Graph and M365 audit logs
+    are UTC-based.
+
+    Returns None if the timestamp is missing or invalid.
     """
     if not value:
         return None
 
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed_datetime = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
 
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+        # If the datetime has no timezone info, treat it as UTC.
+        if parsed_datetime.tzinfo is None:
+            parsed_datetime = parsed_datetime.replace(tzinfo=timezone.utc)
 
-        return parsed.astimezone(timezone.utc)
+        return parsed_datetime
 
-    except Exception:
+    except ValueError:
         return None
 
 
 def minutes_between(first_time, second_time):
     """
-    Return the absolute time difference between two datetime objects in minutes.
+    Return the absolute number of minutes between two datetime values.
+
+    This is used to calculate how close a suspicious sign-in was to mailbox
+    rule or forwarding activity.
     """
+    if not first_time or not second_time:
+        return None
+
     return abs((second_time - first_time).total_seconds()) / 60
 
 
 def normalize_user(value):
     """
-    Normalize a user identifier for same-user comparisons.
+    Normalize a username or email address for reliable comparisons.
     """
     return str(value or "").lower().strip()
 
 
 def get_event_text(event):
     """
-    Build lowercase searchable text from an event.
+    Convert an event into lowercase searchable text.
 
-    Some normalized events may have only raw payload text, while others may
-    expose fields such as app_display_name, user_agent, or client_app. Combining
-    these makes suspicious indicator checks more reliable without needing every
-    client normalizer to expose identical fields.
+    This lets the detector search across the full normalized event for important
+    terms like forwarding, delete, mark-as-read, move-to-folder, device code,
+    python-requests, and other indicators.
     """
-    searchable_parts = [
-        event.get("raw", ""),
-        event.get("app_display_name", ""),
-        event.get("user_agent", ""),
-        event.get("client_app", ""),
-        event.get("original_transfer_method", ""),
-        event.get("risk_detail", ""),
-    ]
-
-    return " ".join(str(part) for part in searchable_parts).lower()
+    return str(event or "").lower()
 
 
 def get_suspicious_signins(signin_events):
     """
-    Return only sign-in events that are suspicious enough for correlation.
+    Return sign-in events that have suspicious context.
+
+    This function is intentionally broader than a single detector rule because
+    correlation needs context. A sign-in may be suspicious because it failed,
+    came from a new location, used a risky sign-in level, had a conditional
+    access issue, or included suspicious text indicators.
     """
-    return [
-        event for event in signin_events
-        if is_suspicious_signin(event)
-    ]
+    suspicious_signins = []
+
+    for event in signin_events or []:
+        if is_suspicious_signin(event):
+            suspicious_signins.append(event)
+
+    return suspicious_signins
 
 
 def is_suspicious_signin(event):
     """
     Decide whether a sign-in event is suspicious enough to use in correlation.
 
-    This does not create an alert by itself.
-    It only marks a sign-in as suspicious context for mailbox-related activity.
+    This does not necessarily mean the sign-in is malicious by itself. It means
+    the sign-in has enough risk context that it should be correlated with
+    mailbox activity.
     """
-    status = str(event.get("status", "")).lower()
-    hour = event.get("hour")
+    event_text = get_event_text(event)
 
-    risk_level = str(
-        event.get("risk_level_aggregated")
-        or event.get("risk_level")
-        or ""
-    ).lower()
-
+    status = str(event.get("status", "")).lower().strip()
     conditional_access_status = str(
         event.get("conditional_access_status", "")
-    ).lower()
-
-    event_text = get_event_text(event)
+    ).lower().strip()
+    risk_level = str(event.get("risk_level", "")).lower().strip()
+    risk_level_aggregated = str(
+        event.get("risk_level_aggregated", "")
+    ).lower().strip()
 
     if status == "failure":
         return True
@@ -135,19 +138,17 @@ def is_suspicious_signin(event):
     if event.get("new_location"):
         return True
 
-    # Microsoft Graph sign-in timestamps are UTC.
-    # This roughly maps to suspicious overnight activity for many U.S. users.
-    if status == "success" and hour is not None and (7 <= hour <= 10):
-        return True
-
     if risk_level in RISKY_SIGNIN_LEVELS:
         return True
 
-    if conditional_access_status == "failure":
+    if risk_level_aggregated in RISKY_SIGNIN_LEVELS:
+        return True
+
+    if conditional_access_status in {"failure", "reportonlyfailure"}:
         return True
 
     for indicator in SUSPICIOUS_SIGNIN_TEXT_INDICATORS:
-        if indicator in event_text:
+        if indicator.lower() in event_text:
             return True
 
     return False
@@ -155,174 +156,219 @@ def is_suspicious_signin(event):
 
 def get_email_event_behavior(email_event):
     """
-    Classify mailbox configuration events for correlation.
+    Classify the mailbox activity behavior.
 
-    Important:
-    Only mailbox rule/configuration operations should be correlated.
+    The returned behavior is used to determine alert severity.
 
-    Normal mailbox activity like MailItemsAccessed, Send, Update, Create,
-    AttachmentAccess, MoveToDeletedItems, etc. should not become correlation
-    alerts here. Those should be handled by separate detectors if needed.
+    Possible return values:
+    - external_forwarding
+    - hide_delete_rule
+    - generic_mailbox_rule
+    - removed_mailbox_rule
+    - None
     """
-    operation = email_event.get("operation", "")
-    raw_text = str(email_event.get("raw", "")).lower()
+    operation = str(email_event.get("operation", "")).strip()
+    event_text = get_event_text(email_event)
 
     if operation not in MAILBOX_CONFIGURATION_OPERATIONS:
-        return "unknown"
+        return None
 
-    if any(term in raw_text for term in FORWARDING_KEYWORDS):
-        return "external_forwarding"
+    for keyword in FORWARDING_KEYWORDS:
+        if keyword.lower() in event_text:
+            return "external_forwarding"
 
-    if any(term in raw_text for term in HIDE_OR_DELETE_KEYWORDS):
-        return "hide_delete_rule"
-
-    if operation in {"New-InboxRule", "Set-InboxRule", "Set-Mailbox"}:
-        return "generic_mailbox_rule"
+    for keyword in HIDE_OR_DELETE_KEYWORDS:
+        if keyword.lower() in event_text:
+            return "hide_delete_rule"
 
     if operation == "Remove-InboxRule":
         return "removed_mailbox_rule"
 
-    return "unknown"
+    if operation in {"New-InboxRule", "Set-InboxRule", "Set-Mailbox"}:
+        return "generic_mailbox_rule"
+
+    return None
 
 
-def is_mailbox_rule_or_forwarding_event(event):
+def is_mailbox_rule_or_forwarding_event(email_event):
     """
-    Decide whether an email audit event is worth considering for correlation.
-
-    Remove-InboxRule is kept as context, but it intentionally receives lower
-    severity than forwarding or hide/delete behavior.
+    Return True when an Exchange audit event is relevant for mailbox compromise
+    correlation.
     """
-    behavior = get_email_event_behavior(event)
-
-    return behavior in {
-        "external_forwarding",
-        "hide_delete_rule",
-        "generic_mailbox_rule",
-        "removed_mailbox_rule",
-    }
+    return get_email_event_behavior(email_event) is not None
 
 
-def get_correlation_result(signin_event, email_event, minutes_difference):
+def get_correlation_result(mailbox_behavior, time_difference_minutes):
     """
-    Determine correlation severity based on:
-    - mailbox behavior type
-    - time distance between sign-in and mailbox activity
+    Decide whether a suspicious sign-in and mailbox event should create an alert.
 
-    signin_event is accepted for future tuning. For example, later we may
-    increase severity when a correlated sign-in used device code flow,
-    suspicious automation clients, or impossible travel.
+    The closer the mailbox rule activity happens to suspicious sign-in activity,
+    the more severe the alert.
+
+    V1 severity logic:
+    - External forwarding within 24 hours: CRITICAL
+    - Hide/delete rule within 60 minutes: CRITICAL
+    - Hide/delete rule within 24 hours: HIGH
+    - Generic mailbox rule within 60 minutes: HIGH
+    - Generic mailbox rule within 24 hours: MEDIUM
+    - Removed inbox rule within 60 minutes: MEDIUM
     """
-    behavior = get_email_event_behavior(email_event)
+    if time_difference_minutes is None:
+        return None
 
-    if behavior == "external_forwarding":
-        if minutes_difference <= HIGH_CONFIDENCE_CORRELATION_WINDOW_MINUTES:
-            return (
-                "critical",
-                "Suspicious sign-in + external forwarding within 24 hours",
-            )
+    if mailbox_behavior == "external_forwarding":
+        if time_difference_minutes <= 1440:
+            return {
+                "severity": "critical",
+                "reason": "Suspicious sign-in + mailbox forwarding activity within 24 hours",
+            }
 
-    if behavior == "hide_delete_rule":
-        if minutes_difference <= CRITICAL_CORRELATION_WINDOW_MINUTES:
-            return (
-                "critical",
-                "Suspicious sign-in + mailbox hide/delete rule within 60 minutes",
-            )
+    if mailbox_behavior == "hide_delete_rule":
+        if time_difference_minutes <= 60:
+            return {
+                "severity": "critical",
+                "reason": "Suspicious sign-in + mailbox hide/delete rule within 60 minutes",
+            }
 
-        if minutes_difference <= HIGH_CONFIDENCE_CORRELATION_WINDOW_MINUTES:
-            return (
-                "high",
-                "Suspicious sign-in + mailbox hide/delete rule within 24 hours",
-            )
+        if time_difference_minutes <= 1440:
+            return {
+                "severity": "high",
+                "reason": "Suspicious sign-in + mailbox hide/delete rule within 24 hours",
+            }
 
-    if behavior == "generic_mailbox_rule":
-        if minutes_difference <= CRITICAL_CORRELATION_WINDOW_MINUTES:
-            return (
-                "high",
-                "Suspicious sign-in + mailbox rule within 60 minutes",
-            )
+    if mailbox_behavior == "generic_mailbox_rule":
+        if time_difference_minutes <= 60:
+            return {
+                "severity": "high",
+                "reason": "Suspicious sign-in + mailbox rule activity within 60 minutes",
+            }
 
-        if minutes_difference <= HIGH_CONFIDENCE_CORRELATION_WINDOW_MINUTES:
-            return (
-                "medium",
-                "Suspicious sign-in + mailbox rule within 24 hours",
-            )
+        if time_difference_minutes <= 1440:
+            return {
+                "severity": "medium",
+                "reason": "Suspicious sign-in + mailbox rule activity within 24 hours",
+            }
 
-    if behavior == "removed_mailbox_rule":
-        if minutes_difference <= CRITICAL_CORRELATION_WINDOW_MINUTES:
-            return (
-                "medium",
-                "Suspicious sign-in + mailbox rule removal within 60 minutes",
-            )
+    if mailbox_behavior == "removed_mailbox_rule":
+        if time_difference_minutes <= 60:
+            return {
+                "severity": "medium",
+                "reason": "Suspicious sign-in + inbox rule removal within 60 minutes",
+            }
 
-    return None, None
+    return None
 
 
 def detect_signin_email_correlation(signin_events, email_events):
     """
-    Detect suspicious sign-in activity correlated with mailbox rule, forwarding,
-    or hide/delete activity for the same user.
+    Correlate suspicious sign-ins with mailbox rule/forwarding activity.
 
-    The caller decides whether signin_events and email_events are current-run
-    events or cached events. This function only correlates the lists it receives.
+    This function compares suspicious sign-ins and suspicious mailbox events for
+    the same user. If the events are close enough together, it creates a
+    compromise-style alert.
+
+    Mountain Time display:
+    - Microsoft timestamps stay UTC internally.
+    - The alert detail also includes Mountain Time for readability.
     """
     alerts = []
 
-    suspicious_signins = [
-        event for event in signin_events
-        if is_suspicious_signin(event)
-    ]
+    suspicious_signins = get_suspicious_signins(signin_events)
 
-    suspicious_email_events = [
-        event for event in email_events
+    mailbox_events = [
+        event
+        for event in email_events or []
         if is_mailbox_rule_or_forwarding_event(event)
     ]
 
-    for signin in suspicious_signins:
-        signin_user = normalize_user(signin.get("user"))
-        signin_time = parse_datetime(signin.get("created_datetime"))
+    for signin_event in suspicious_signins:
+        signin_user = normalize_user(signin_event.get("user"))
+        signin_datetime = parse_datetime(signin_event.get("created_datetime"))
 
-        if not signin_user or not signin_time:
+        if not signin_user or not signin_datetime:
             continue
 
-        for email_event in suspicious_email_events:
+        for email_event in mailbox_events:
             email_user = normalize_user(email_event.get("user"))
-            email_time = parse_datetime(email_event.get("created_datetime"))
+            email_datetime = parse_datetime(email_event.get("created_datetime"))
 
-            if not email_user or not email_time:
+            if not email_user or not email_datetime:
                 continue
 
             if signin_user != email_user:
                 continue
 
-            minutes_diff = minutes_between(signin_time, email_time)
+            mailbox_behavior = get_email_event_behavior(email_event)
 
-            severity, window_label = get_correlation_result(
-                signin_event=signin,
-                email_event=email_event,
-                minutes_difference=minutes_diff,
-            )
-
-            if not severity:
+            if not mailbox_behavior:
                 continue
 
+            time_difference_minutes = minutes_between(
+                signin_datetime,
+                email_datetime,
+            )
+
+            correlation_result = get_correlation_result(
+                mailbox_behavior=mailbox_behavior,
+                time_difference_minutes=time_difference_minutes,
+            )
+
+            if not correlation_result:
+                continue
+
+            rounded_time_difference = round(time_difference_minutes, 1)
+
+            signin_time_utc = signin_event.get("created_datetime", "Unknown")
+            mailbox_time_utc = email_event.get("created_datetime", "Unknown")
+
+            signin_time_mountain = format_mountain_time(signin_time_utc)
+            mailbox_time_mountain = format_mountain_time(mailbox_time_utc)
+
+            signin_app = signin_event.get("app_display_name", "Unknown")
+            signin_ip = signin_event.get("ip_address", "Unknown")
+            signin_location = signin_event.get("location", "Unknown")
+
+            email_operation = email_event.get("operation", "Unknown")
+            email_target = email_event.get("target", "Unknown")
+
             alerts.append({
-                "severity": severity,
+                "severity": correlation_result["severity"],
                 "type": "Possible Email Account Compromise",
-                "user": signin.get("user", "Unknown"),
-                "detail": (
-                    f"Suspicious sign-in activity was correlated with mailbox "
-                    f"rule/forwarding activity. "
-                    f"Correlation window: {window_label}. "
-                    f"Time difference: {round(minutes_diff, 1)} minutes. "
-                    f"Sign-in app: {signin.get('app_display_name', 'Unknown')}. "
-                    f"Sign-in IP: {signin.get('ip_address', 'Unknown')}. "
-                    f"Sign-in location: {signin.get('location', 'Unknown')}. "
-                    f"Email operation: {email_event.get('operation', 'Unknown')}. "
-                    f"Mailbox behavior: {get_email_event_behavior(email_event)}. "
-                    f"Target: {email_event.get('target', 'Unknown')}."
-                ),
-                "location": signin.get("location", "Unknown"),
+                "user": signin_user,
+                "location": signin_location,
                 "source": "Correlation: Entra Sign-In Logs + M365 Audit Logs",
+
+                # Human-readable alert detail for Teams.
+                "detail": (
+                    "Suspicious sign-in activity was correlated with mailbox "
+                    "rule/forwarding activity. "
+                    f"Correlation window: {correlation_result['reason']}. "
+                    f"Time difference: {rounded_time_difference} minutes. "
+                    f"Suspicious sign-in time: {signin_time_mountain} Mountain Time "
+                    f"({signin_time_utc} UTC). "
+                    f"Mailbox activity time: {mailbox_time_mountain} Mountain Time "
+                    f"({mailbox_time_utc} UTC). "
+                    f"Sign-in app: {signin_app}. "
+                    f"Sign-in IP: {signin_ip}. "
+                    f"Sign-in location: {signin_location}. "
+                    f"Email operation: {email_operation}. "
+                    f"Mailbox behavior: {mailbox_behavior}. "
+                    f"Target: {email_target}."
+                ),
+
+                # Structured fields for security_alert_history.json and future V2 use.
+                "correlation_reason": correlation_result["reason"],
+                "time_difference_minutes": rounded_time_difference,
+                "signin_time_mountain": signin_time_mountain,
+                "mailbox_activity_time_mountain": mailbox_time_mountain,
+                "signin_time_utc": signin_time_utc,
+                "mailbox_activity_time_utc": mailbox_time_utc,
+                "signin_app": signin_app,
+                "signin_ip": signin_ip,
+                "signin_location": signin_location,
+                "email_operation": email_operation,
+                "mailbox_behavior": mailbox_behavior,
+                "email_target": email_target,
             })
 
     return alerts
@@ -335,37 +381,51 @@ def detect_correlations(
     cached_email_events=None,
 ):
     """
-    Main correlation detector entry point.
+    Run all correlation detections.
 
-    signin_events:
-        New sign-ins from this run.
+    This supports both same-run and cross-run correlation.
 
-    email_events:
-        New email audit events from this run.
+    Same-run correlation:
+    - New sign-ins compared with new email audit events.
 
-    cached_signins:
-        Suspicious sign-ins from previous runs.
+    Cross-run correlation:
+    - Cached suspicious sign-ins compared with new email audit events.
+    - New sign-ins compared with cached mailbox events.
 
-    cached_email_events:
-        Mailbox rule / forwarding / hide-delete activity from previous runs.
-
-    Important:
-        To avoid repeated cached-to-cached alerts every run, main.py should
-        call this in two passes:
-
-        1. cached suspicious sign-ins + new email events
-        2. new sign-ins + cached mailbox events
-
-        Avoid calling it with both cached_signins and cached_email_events unless
-        pair-level deduplication is added later.
+    We intentionally avoid cached-signins to cached-email-events because that can
+    repeatedly alert on old activity every scheduled run.
     """
+    alerts = []
+
+    signin_events = signin_events or []
+    email_events = email_events or []
     cached_signins = cached_signins or []
     cached_email_events = cached_email_events or []
 
-    combined_signins = cached_signins + signin_events
-    combined_email_events = cached_email_events + email_events
-
-    return detect_signin_email_correlation(
-        signin_events=combined_signins,
-        email_events=combined_email_events,
+    # Same-run correlation.
+    alerts.extend(
+        detect_signin_email_correlation(
+            signin_events=signin_events,
+            email_events=email_events,
+        )
     )
+
+    # Cross-run correlation:
+    # suspicious sign-ins from a previous run + newly arrived mailbox activity.
+    alerts.extend(
+        detect_signin_email_correlation(
+            signin_events=cached_signins,
+            email_events=email_events,
+        )
+    )
+
+    # Cross-run correlation:
+    # newly arrived sign-ins + mailbox activity from a previous run.
+    alerts.extend(
+        detect_signin_email_correlation(
+            signin_events=signin_events,
+            email_events=cached_email_events,
+        )
+    )
+
+    return alerts

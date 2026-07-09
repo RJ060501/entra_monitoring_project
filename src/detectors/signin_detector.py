@@ -194,6 +194,8 @@ def detect_failed_then_success(events, cached_failed_signins=None):
             failure_count = len(failures_before_success)
 
             latest_failure = failures_before_success[-1]
+            
+            success_from_new_location = bool(event.get("new_location"))
 
             # Why:
             # Repeated Microsoft sign-in failures can happen during normal
@@ -201,9 +203,15 @@ def detect_failed_then_success(events, cached_failed_signins=None):
             # registration. Those should be visible, but should only become
             # HIGH when the eventual success happens from a new location.
             if event.get("new_location"):
-                severity = "high"
-            else:
                 severity = "medium"
+                severity_reason = (
+                    "failed sign-ins were followed by a successful sign-in from a new location"
+                )
+            else:
+                severity = "low"
+                severity_reason = (
+                    "failed sign-ins were followed by success, but the success was not from a new location"
+                )
 
             alerts.append({
                 "severity": severity,
@@ -211,13 +219,25 @@ def detect_failed_then_success(events, cached_failed_signins=None):
                 "user": user,
                 "detail": (
                     f"{failure_count} failed sign-in(s) followed by success. "
+                    f"Severity reason: {severity_reason}. "
+                    f"Success from new location: {success_from_new_location}. "
                     f"Successful app: {event.get('app_display_name', 'Unknown')}. "
                     f"IP: {event.get('ip_address', 'Unknown')}. "
-                    f"Last failure reason: {latest_failure.get('failure_reason', 'Unknown')}"
+                    f"Location: {event.get('location', 'Unknown')}. "
+                    f"Last failure reason: {latest_failure.get('failure_reason', 'Unknown')}."
                 ),
                 "location": event.get("location", "Unknown"),
                 "source": "Entra Sign-In Logs",
                 "cache_clear_user": user,
+
+                # Structured fields for security_alert_history.json and future tuning.
+                "failure_count": failure_count,
+                "success_from_new_location": success_from_new_location,
+                "severity_reason": severity_reason,
+                "signin_ip": event.get("ip_address", "Unknown"),
+                "signin_app": event.get("app_display_name", "Unknown"),
+                "signin_location": event.get("location", "Unknown"),
+                "last_failure_reason": latest_failure.get("failure_reason", "Unknown"),
             })
 
             # Reset so multiple successes in the same run do not all alert from
