@@ -283,17 +283,24 @@ def detect_hide_or_delete_rules(events):
         rule_name = clean_rule_target(event.get("target", "Unknown"))
 
         if strong_matches or (move_matches and sensitive_matches):
-            severity = "high"
+            severity = "low"
+            severity_reason = ("standalone mailbox rule activity detected; severity reamins low  unless "
+                               "correlated with suspicious sign-in activity"
+                               )
         elif move_matches:
             severity = "low"
+            severity_reason = "mailbox move rule detected without stronger compromise context"
         else:
             severity = "low"
+            severity_reason = "mailbox rule activity detected without stronger compromise context"
 
         detail_parts = [
             f"Mailbox rule may move, hide, delete, archive, or suppress mail.",
             f"Rule: {rule_name}.",
             f"Operation: {operation}.",
         ]
+        
+        detail_parts.append(f"Severity reason: {severity_reason}.")
 
         if move_matches:
             detail_parts.append(

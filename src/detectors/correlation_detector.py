@@ -230,7 +230,7 @@ def get_correlation_result(mailbox_behavior, time_difference_minutes):
                 "reason": "Suspicious sign-in + mailbox hide/delete rule within 60 minutes",
             }
 
-        if time_difference_minutes <= 1440:
+        if time_difference_minutes <= 240:
             return {
                 "severity": "high",
                 "reason": "Suspicious sign-in + mailbox hide/delete rule within 24 hours",
@@ -243,7 +243,7 @@ def get_correlation_result(mailbox_behavior, time_difference_minutes):
                 "reason": "Suspicious sign-in + mailbox rule activity within 60 minutes",
             }
 
-        if time_difference_minutes <= 1440:
+        if time_difference_minutes <= 240:
             return {
                 "severity": "medium",
                 "reason": "Suspicious sign-in + mailbox rule activity within 24 hours",

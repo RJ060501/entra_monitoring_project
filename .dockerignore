@@ -1,0 +1,32 @@
+#Git
+.git
+.gitignore
+
+#Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+#Virtual Environment
+.venv/
+venv/
+
+# Local Secrets
+.env
+
+# Runtime stat and logs should be mounted, not baked into the image
+state/
+logs/
+
+# Editor/system files
+.vscode/
+.idea/
+.DS_Store
+
+# Local notes or scrath files
+*.log
+*.json

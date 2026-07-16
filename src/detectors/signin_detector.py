@@ -358,13 +358,12 @@ def detect_new_location_burst(
         has_mailbox_context = normalized_user in mailbox_context_users
         has_suspicious_context = has_suspicious_signin_context(user_events)
 
+        multiple_locations = location_count >= 2
+        multiple_ips = ip_count >= 2
+
         if has_mailbox_context:
             severity = "high"
             reason = "new-location burst paired with mailbox activity"
-
-        elif location_count >= 2 or ip_count >= 2:
-            severity = "high"
-            reason = "multiple new locations or IP addresses"
 
         elif has_suspicious_context:
             severity = "medium"
@@ -373,6 +372,18 @@ def detect_new_location_burst(
         elif has_failed_context:
             severity = "medium"
             reason = "new-location burst paired with failed sign-in context"
+
+        elif multiple_locations and multiple_ips:
+            severity = "medium"
+            reason = "multiple new locations and multiple IP addresses"
+
+        elif multiple_ips:
+            severity = "medium"
+            reason = "multiple new IP addresses"
+
+        elif multiple_locations:
+            severity = "low"
+            reason = "multiple location labels from the same IP address"
 
         else:
             severity = "low"
@@ -386,7 +397,9 @@ def detect_new_location_burst(
                 f"{event_count} successful sign-in(s) from new location activity. "
                 f"Reason: {reason}. "
                 f"Locations: {', '.join(sorted(locations))}. "
+                f"Location count: {location_count}. "
                 f"IP address(es): {', '.join(sorted(ip_addresses))}. "
+                f"IP count: {ip_count}. "
                 f"Apps: {', '.join(sorted(apps))}."
             ),
             "location": ", ".join(sorted(locations)),
