@@ -51,4 +51,7 @@ Thumbs.db
 # SRC FOLDERS
 # =========================
 state/
+*.db
+*.sqlite
+*.sqlite3
 logs/
