@@ -387,6 +387,8 @@ class EntraClient:
         url = (
             f"{self.base_url}/auditLogs/directoryAudits"
             f"?$filter=activityDateTime ge {start_time}"
+            f"&$orderby=activityDateTime desc"
+            f"&$top=100"
         )
 
         data = self._get_graph_collection(

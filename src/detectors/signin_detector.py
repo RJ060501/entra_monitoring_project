@@ -37,6 +37,7 @@ def detect_signin_events(events, cached_failed_signins=None):
         events=events,
         cached_failed_signins=cached_failed_signins,
     )
+    alerts = merge_related_signin_alerts(alerts)
 
     return alerts
 
@@ -458,3 +459,533 @@ def has_suspicious_signin_context(events):
             return True
 
     return False
+
+#V2 alert merging logic for sign-in detectors
+
+def merge_related_signin_alerts(alerts):
+    """
+    Merge related sign-in alerts into one clearer sequence alert.
+
+    Why this exists:
+    Some real-world sign-in patterns trigger multiple individual detectors.
+    For example:
+    - Unusual Login Time
+    - Failed Sign-ins Followed by Success
+    - New Location Sign-in Burst
+
+    Each detector is useful by itself, but when they describe the same user
+    and overlapping sign-in context, multiple Teams alerts can create noise.
+
+    This function keeps the detection signal, but consolidates related alerts
+    into a single "Suspicious Sign-in Sequence" alert that explains the series
+    of alerts that caused it.
+    """
+    if not alerts:
+        return []
+
+    grouped_alerts = group_signin_alerts_by_user(alerts)
+
+    final_alerts = []
+    consumed_alert_ids = set()
+
+    for user_key, user_alerts in grouped_alerts.items():
+        sequence_alert = build_related_signin_sequence_alert(user_alerts)
+
+        if not sequence_alert:
+            continue
+
+        for alert in sequence_alert.get("merged_alerts", []):
+            consumed_alert_ids.add(id(alert))
+
+        final_alerts.append(sequence_alert)
+
+    for alert in alerts:
+        if id(alert) not in consumed_alert_ids:
+            final_alerts.append(alert)
+
+    return final_alerts
+
+
+def group_signin_alerts_by_user(alerts):
+    """
+    Group sign-in alerts by user.
+
+    We group by user first because sign-in sequences should not merge across
+    different users, even if locations or IPs are similar.
+    """
+    grouped = {}
+
+    for alert in alerts:
+        user = normalize_signin_merge_value(alert.get("user"))
+
+        if not user:
+            continue
+
+        grouped.setdefault(user, []).append(alert)
+
+    return grouped
+
+
+def build_related_signin_sequence_alert(user_alerts):
+    """
+    Build a consolidated Suspicious Sign-in Sequence alert when related
+    sign-in alerts exist for the same user.
+
+    A sequence alert is created when a New Location Sign-in Burst is paired
+    with at least one additional suspicious sign-in signal, such as:
+    - Failed Sign-ins Followed by Success
+    - Unusual Login Time
+
+    This keeps standalone new-location bursts intact unless there is another
+    related sign-in signal to explain.
+    """
+    # Pull out the strongest anchor alert first: the burst is the main event that
+    # provides the most context about the sequence (location, IPs, app mix, volume).
+    # This keeps the final merged alert anchored to the real suspicious pattern.
+    burst_alerts = [
+        alert for alert in user_alerts
+        if alert.get("type") == "New Location Sign-in Burst"
+    ]
+
+    failed_success_alerts = [
+        alert for alert in user_alerts
+        if alert.get("type") == "Failed Sign-ins Followed by Success"
+    ]
+
+    unusual_time_alerts = [
+        alert for alert in user_alerts
+        if alert.get("type") == "Unusual Login Time"
+    ]
+
+    # A burst alone is not enough to create a consolidated sequence alert.
+    # We only merge when the burst is paired with additional context that makes
+    # the pattern worth summarizing into one higher-level security event.
+    if not burst_alerts:
+        return None
+
+    if not failed_success_alerts and not unusual_time_alerts:
+        return None
+
+    # Use the first burst alert as the anchor because it is the most complete
+    # summary of the suspicious activity and the best candidate for correlation.
+    best_burst_alert = burst_alerts[0]
+
+    # Build the list of related alerts that are temporally and contextually tied
+    # to this burst, using shared user, location, and/or IP characteristics.
+    related_alerts = []
+
+    related_alerts.extend(
+        find_contextually_related_alerts(
+            anchor_alert=best_burst_alert,
+            candidate_alerts=failed_success_alerts,
+        )
+    )
+
+    related_alerts.extend(
+        find_contextually_related_alerts(
+            anchor_alert=best_burst_alert,
+            candidate_alerts=unusual_time_alerts,
+        )
+    )
+
+    # If the burst had no valid supporting alerts, do not collapse the event.
+    # The original individual alerts should remain visible instead of being merged.
+    if not related_alerts:
+        return None
+
+    # Preserve the anchor alert first so the merged summary keeps the most
+    # informative signal at the front, then append only the related evidence.
+    merged_alerts = [best_burst_alert] + related_alerts
+
+    # Choose the effective user from the anchor or first related alert, falling
+    # back to "Unknown" if neither provides a value.
+    user = best_burst_alert.get("user") or related_alerts[0].get("user") or "Unknown"
+
+    # Summarize the combined evidence across all merged alerts so the final alert
+    # is readable and easier for analysts to audit.
+    location = build_sequence_location_summary(merged_alerts)
+    ip_summary = build_sequence_ip_summary(merged_alerts)
+    app_summary = build_sequence_app_summary(merged_alerts)
+
+    # Explain why the merged sequence is suspicious, combining the factors that
+    # contributed to the final alert.
+    sequence_reason = build_sequence_reason(
+        has_failed_success=bool(failed_success_alerts),
+        unusual_time_count=len(unusual_time_alerts),
+        has_burst=True,
+    )
+
+    # Severity is based on the combined evidence of the sequence rather than any
+    # single detector in isolation.
+    severity = get_sequence_severity(merged_alerts)
+
+    # Create a concise but explainable summary for Teams or reporting output.
+    detail = (
+        "Suspicious sign-in sequence detected. "
+        f"Reason: {sequence_reason}. "
+        "Formula: "
+        f"{build_sequence_formula(merged_alerts)}. "
+        f"User: {user}. "
+        f"Locations: {location}. "
+        f"IP address(es): {ip_summary}. "
+        f"Apps: {app_summary}. "
+        "Merged alert evidence: "
+        f"{build_merged_alert_evidence(merged_alerts)}"
+    )
+
+    # Return a single consolidated alert object that preserves the original
+    # evidence list and the full set of correlated alert types.
+    return {
+        "type": "Suspicious Sign-in Sequence",
+        "severity": severity,
+        "user": user,
+        "location": location,
+        "source": "Entra Sign-In Logs",
+        "detail": detail,
+        "ip_address": ip_summary,
+        "merged_alerts": merged_alerts,
+        "correlated_alert_types": [
+            alert.get("type") for alert in merged_alerts
+        ],
+    }
+
+
+def find_contextually_related_alerts(anchor_alert, candidate_alerts):
+    """
+    Find alerts that appear related to the anchor alert.
+
+    The anchor alert is usually New Location Sign-in Burst because it contains
+    the richest summary of locations, IPs, apps, and burst behavior.
+
+    We consider an alert related when:
+    - It is for the same user, and
+    - It shares location context or IP context with the anchor alert.
+
+    If IP cannot be extracted, shared location is enough for V2 production
+    correlation because Microsoft location labels are already part of the
+    sign-in signal.
+    """
+    # Accumulator for candidate alerts that are determined to be related
+    related = []
+
+    # Normalize the anchor alert user for reliable, case-insensitive comparison
+    anchor_user = normalize_signin_merge_value(anchor_alert.get("user"))
+
+    # Extract normalized sets of locations and IPs from the anchor alert.
+    # These helper functions parse both structured fields and free-text detail
+    # so comparisons below operate on canonicalized values.
+    anchor_locations = extract_locations_from_alert(anchor_alert)
+    anchor_ips = extract_ips_from_alert(anchor_alert)
+
+    for candidate in candidate_alerts:
+        # Normalize the candidate user and skip if it does not match the anchor
+        candidate_user = normalize_signin_merge_value(candidate.get("user"))
+
+        # Only consider alerts for the same (normalized) user
+        if anchor_user != candidate_user:
+            continue
+
+        # Extract the candidate's location and IP sets for comparison
+        candidate_locations = extract_locations_from_alert(candidate)
+        candidate_ips = extract_ips_from_alert(candidate)
+
+        # Check for any overlap in location or IP context between anchor and candidate
+        has_shared_location = bool(anchor_locations.intersection(candidate_locations))
+        has_shared_ip = bool(anchor_ips.intersection(candidate_ips))
+
+        # If either context overlaps, treat the candidate as related to the anchor
+        if has_shared_location or has_shared_ip:
+            related.append(candidate)
+
+    return related
+
+
+def build_sequence_reason(has_failed_success, unusual_time_count, has_burst):
+    """
+    Build a human-readable explanation for why the sequence alert exists.
+    """
+    reasons = []
+
+    if has_failed_success:
+        reasons.append("failed sign-ins were followed by a successful sign-in")
+
+    if unusual_time_count == 1:
+        reasons.append("an unusual-time sign-in occurred")
+    elif unusual_time_count > 1:
+        reasons.append(f"{unusual_time_count} unusual-time sign-ins occurred")
+
+    if has_burst:
+        reasons.append("new-location sign-in burst activity occurred")
+
+    return "; ".join(reasons)
+
+
+def build_sequence_formula(merged_alerts):
+    """
+    Explain the alert formula as a readable series of detector outputs.
+    """
+    alert_types = []
+
+    for alert in merged_alerts:
+        alert_type = alert.get("type") or "Unknown Alert"
+        if alert_type not in alert_types:
+            alert_types.append(alert_type)
+
+    return " + ".join(alert_types) + " → Suspicious Sign-in Sequence"
+
+
+def build_merged_alert_evidence(merged_alerts):
+    """
+    Preserve the useful evidence from the original alerts in the new alert.
+
+    This keeps the consolidated alert explainable and auditable.
+    """
+    evidence_parts = []
+
+    for alert in merged_alerts:
+        alert_type = alert.get("type") or "Unknown Alert"
+        detail = alert.get("detail") or "No detail available"
+
+        evidence_parts.append(f"[{alert_type}] {detail}")
+
+    return " ".join(evidence_parts)
+
+
+def get_sequence_severity(merged_alerts):
+    """
+    Decide severity for the consolidated sign-in sequence.
+
+    Default:
+    - MEDIUM for related sign-in anomalies.
+
+    Escalate to HIGH only when stronger context appears in the merged evidence.
+    """
+    combined_detail = " ".join(
+        str(alert.get("detail", "")).lower()
+        for alert in merged_alerts
+    )
+
+    high_indicators = [
+        "multiple new ip",
+        "multiple ip",
+        "ip count: 2",
+        "ip count: 3",
+        "ip count: 4",
+        "location count: 2",
+        "location count: 3",
+        "location count: 4",
+        "risky",
+        "risk level: medium",
+        "risk level: high",
+        "exchange admin center",
+        "microsoft 365 admin portal",
+        "office365 shell",
+        "security and compliance",
+    ]
+
+    for indicator in high_indicators:
+        if indicator in combined_detail:
+            return "high"
+
+    return "medium"
+
+
+def build_sequence_location_summary(alerts):
+    """
+    Build a clean comma-separated location summary from merged alerts.
+    """
+    locations = set()
+
+    for alert in alerts:
+        locations.update(extract_locations_from_alert(alert))
+
+    if not locations:
+        return "Unknown"
+
+    return ", ".join(sorted(locations))
+
+
+def build_sequence_ip_summary(alerts):
+    """
+    Build a clean comma-separated IP summary from merged alerts.
+    """
+    ips = set()
+
+    for alert in alerts:
+        ips.update(extract_ips_from_alert(alert))
+
+    if not ips:
+        return "Unknown"
+
+    return ", ".join(sorted(ips))
+
+
+def build_sequence_app_summary(alerts):
+    """
+    Build a clean app summary from merged alert details when possible.
+    """
+    apps = set()
+
+    for alert in alerts:
+        detail = str(alert.get("detail", ""))
+
+        if "Apps:" in detail:
+            after_marker = detail.split("Apps:", 1)[1].strip()
+            app_text = after_marker.split(".")[0].strip()
+
+            for app in app_text.split(","):
+                cleaned_app = app.strip()
+                if cleaned_app:
+                    apps.add(cleaned_app)
+
+        if "Successful app:" in detail:
+            after_marker = detail.split("Successful app:", 1)[1].strip()
+            app_text = after_marker.split(".")[0].strip()
+
+            if app_text:
+                apps.add(app_text)
+
+        app_display_name = alert.get("app_display_name")
+        if app_display_name:
+            apps.add(str(app_display_name).strip())
+
+    if not apps:
+        return "Unknown"
+
+    return ", ".join(sorted(apps))
+
+
+def extract_locations_from_alert(alert):
+    """
+    Extract location values from the alert location field and detail text.
+
+    Supports:
+    - alert["location"]
+    - "Locations: location1, location2."
+    - "Location: location."
+    """
+    locations = set()
+
+    location_value = alert.get("location")
+    if location_value:
+        for location in split_location_list(location_value):
+            locations.add(location)
+
+    detail = str(alert.get("detail", ""))
+
+    if "Locations:" in detail:
+        after_marker = detail.split("Locations:", 1)[1].strip()
+        location_text = after_marker.split(".")[0].strip()
+
+        for location in split_location_list(location_text):
+            locations.add(location)
+
+    elif "Location:" in detail:
+        after_marker = detail.split("Location:", 1)[1].strip()
+        location_text = after_marker.split(".")[0].strip()
+
+        for location in split_location_list(location_text):
+            locations.add(location)
+
+    return {
+        normalize_display_value(location)
+        for location in locations
+        if normalize_display_value(location)
+    }
+
+
+def extract_ips_from_alert(alert):
+    """
+    Extract IP addresses from alert fields and detail text.
+
+    Supports:
+    - alert["ip_address"]
+    - "IP: x.x.x.x"
+    - "IP address(es): x.x.x.x, y.y.y.y"
+    """
+    ips = set()
+
+    ip_value = alert.get("ip_address")
+    if ip_value:
+        for ip in split_ip_list(ip_value):
+            ips.add(ip)
+
+    detail = str(alert.get("detail", ""))
+
+    if "IP address(es):" in detail:
+        after_marker = detail.split("IP address(es):", 1)[1].strip()
+        ip_text = after_marker.split(". ")[0].strip()
+        ip_text = ip_text.split(" Apps:")[0].strip()
+
+        for ip in split_ip_list(ip_text):
+            ips.add(ip)
+
+    elif "IP:" in detail:
+        after_marker = detail.split("IP:", 1)[1].strip()
+        ip_text = after_marker.split(". ")[0].strip()
+        ip_text = ip_text.split(" Location:")[0].strip()
+        ip_text = ip_text.split(" Apps:")[0].strip()
+
+        for ip in split_ip_list(ip_text):
+            ips.add(ip)
+
+    return {
+        normalize_display_value(ip)
+        for ip in ips
+        if normalize_display_value(ip)
+    }
+
+
+def split_location_list(value):
+    """
+    Split a location field into individual location strings.
+
+    This intentionally avoids complex parsing. The detector-generated location
+    strings are already readable and consistent enough for V2 alert merging.
+    """
+    if not value:
+        return []
+
+    return [
+        item.strip()
+        for item in str(value).split(", ")
+        if item.strip()
+    ]
+
+
+def split_ip_list(value):
+    """
+    Split an IP list while preserving IPv6 addresses.
+
+    IPv6 addresses contain colons, so we only split on comma separators.
+    """
+    if not value:
+        return []
+
+    return [
+        item.strip()
+        for item in str(value).split(",")
+        if item.strip()
+    ]
+
+
+def normalize_signin_merge_value(value):
+    """
+    Normalize values for comparison.
+    """
+    if not value:
+        return ""
+
+    return str(value).strip().lower()
+
+
+def normalize_display_value(value):
+    """
+    Normalize display values without forcing lowercase.
+
+    We keep original casing for Teams alerts but remove extra whitespace.
+    """
+    if not value:
+        return ""
+
+    return str(value).strip()
