@@ -18,6 +18,7 @@ import logging
 import time
 
 import requests
+from azure.core.exceptions import AzureError
 from azure.identity import ClientSecretCredential
 
 
@@ -72,9 +73,20 @@ class EntraClient:
     def _get_access_token(self):
         """
         Acquire a short-lived bearer token for Microsoft Graph.
+
+        This can fail if Microsoft login is temporarily unreachable, DNS fails,
+        or the network path from Docker/WSL to Microsoft is interrupted.
         """
-        token = self.credential.get_token(self.graph_scope)
-        return token.token
+        try:
+            token = self.credential.get_token(self.graph_scope)
+            return token.token
+
+        except AzureError as exception:
+            logger.error(
+                "Failed to acquire Microsoft Graph access token: %s",
+                exception,
+            )
+            raise
 
     def _get_headers(self):
         """
@@ -181,6 +193,18 @@ class EntraClient:
                     url,
                     exception,
                 )
+                
+            except AzureError as exception:
+                last_exception = exception
+
+                logger.warning(
+                    "Microsoft Graph authentication failed. "
+                    "Attempt %s of %s. URL: %s. Error: %s",
+                    attempt_number,
+                    max_attempts,
+                    url,
+                    exception,
+                )
 
             if attempt_number < max_attempts:
                 time.sleep(retry_sleep_seconds * attempt_number)
@@ -245,7 +269,7 @@ class EntraClient:
 
             return response.json().get("value", [])
 
-        except requests.exceptions.RequestException as exception:
+        except (requests.exceptions.RequestException, AzureError) as exception:
             logger.error(
                 "Failed to retrieve %s from Microsoft Graph after retries: %s",
                 source_name,
