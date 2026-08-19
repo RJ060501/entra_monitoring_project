@@ -92,6 +92,7 @@ from core.alert_suppression import (
 from detectors.signin_detector import (
     detect_signin_events,
     detect_new_location_burst,
+    merge_related_signin_alerts
 )
 from detectors.audit_detector import detect_audit_events
 from detectors.email_detector import detect_email_events
@@ -227,6 +228,7 @@ def main():
         mailbox_events=cached_mailbox_activity_events + new_email_events,
     )
 
+    alerts = merge_related_signin_alerts(alerts)
     alerts += detect_audit_events(new_audits)
     alerts += detect_email_events(new_email_events)
 

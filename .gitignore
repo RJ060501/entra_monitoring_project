@@ -9,6 +9,7 @@
 # PYTHON CACHE
 # =========================
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 *.pyd
@@ -28,6 +29,7 @@ ENV/
 .idea/
 *.swp
 *.swo
+*.json
 
 # =========================
 # OS FILES

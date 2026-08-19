@@ -654,47 +654,41 @@ def find_contextually_related_alerts(anchor_alert, candidate_alerts):
     """
     Find alerts that appear related to the anchor alert.
 
-    The anchor alert is usually New Location Sign-in Burst because it contains
-    the richest summary of locations, IPs, apps, and burst behavior.
+    Safer V2 rule:
+    - Same user is always required.
+    - If both alerts have IP context, require overlapping IPs.
+    - Only fall back to location overlap when one side lacks IP context.
 
-    We consider an alert related when:
-    - It is for the same user, and
-    - It shares location context or IP context with the anchor alert.
-
-    If IP cannot be extracted, shared location is enough for V2 production
-    correlation because Microsoft location labels are already part of the
-    sign-in signal.
+    This prevents false merges where two different locations only overlap on
+    broad location fragments like "US".
     """
-    # Accumulator for candidate alerts that are determined to be related
     related = []
 
-    # Normalize the anchor alert user for reliable, case-insensitive comparison
     anchor_user = normalize_signin_merge_value(anchor_alert.get("user"))
-
-    # Extract normalized sets of locations and IPs from the anchor alert.
-    # These helper functions parse both structured fields and free-text detail
-    # so comparisons below operate on canonicalized values.
     anchor_locations = extract_locations_from_alert(anchor_alert)
     anchor_ips = extract_ips_from_alert(anchor_alert)
 
     for candidate in candidate_alerts:
-        # Normalize the candidate user and skip if it does not match the anchor
         candidate_user = normalize_signin_merge_value(candidate.get("user"))
 
-        # Only consider alerts for the same (normalized) user
         if anchor_user != candidate_user:
             continue
 
-        # Extract the candidate's location and IP sets for comparison
         candidate_locations = extract_locations_from_alert(candidate)
         candidate_ips = extract_ips_from_alert(candidate)
 
-        # Check for any overlap in location or IP context between anchor and candidate
-        has_shared_location = bool(anchor_locations.intersection(candidate_locations))
         has_shared_ip = bool(anchor_ips.intersection(candidate_ips))
+        has_shared_location = bool(anchor_locations.intersection(candidate_locations))
 
-        # If either context overlaps, treat the candidate as related to the anchor
-        if has_shared_location or has_shared_ip:
+        # If both alerts have IP data, require shared IP.
+        # This is safer than allowing broad location overlap to merge alerts.
+        if anchor_ips and candidate_ips:
+            if has_shared_ip:
+                related.append(candidate)
+            continue
+
+        # If IP data is missing on one side, fall back to exact location overlap.
+        if has_shared_location:
             related.append(candidate)
 
     return related
@@ -766,12 +760,8 @@ def get_sequence_severity(merged_alerts):
     )
 
     high_indicators = [
-        "multiple new ip",
-        "multiple ip",
-        "ip count: 2",
         "ip count: 3",
         "ip count: 4",
-        "location count: 2",
         "location count: 3",
         "location count: 4",
         "risky",
@@ -781,6 +771,8 @@ def get_sequence_severity(merged_alerts):
         "microsoft 365 admin portal",
         "office365 shell",
         "security and compliance",
+        "mailbox activity",
+        "conditional access failure",
     ]
 
     for indicator in high_indicators:
@@ -829,9 +821,12 @@ def build_sequence_app_summary(alerts):
     for alert in alerts:
         detail = str(alert.get("detail", ""))
 
-        if "Apps:" in detail:
-            after_marker = detail.split("Apps:", 1)[1].strip()
+        if "App:" in detail:
+            after_marker = detail.split("App:", 1)[1].strip()
             app_text = after_marker.split(".")[0].strip()
+
+            if app_text:
+                apps.add(app_text)
 
             for app in app_text.split(","):
                 cleaned_app = app.strip()
@@ -938,19 +933,44 @@ def extract_ips_from_alert(alert):
 
 def split_location_list(value):
     """
-    Split a location field into individual location strings.
+    Split detector-generated location summaries without breaking individual
+    city/state/country values into separate pieces.
 
-    This intentionally avoids complex parsing. The detector-generated location
-    strings are already readable and consistent enough for V2 alert merging.
+    Examples:
+    - "Denver, Colorado, US"
+      -> ["Denver, Colorado, US"]
+
+    - "Sunland Park, New Mexico, US, Walsenburg, Colorado, US"
+      -> ["Sunland Park, New Mexico, US", "Walsenburg, Colorado, US"]
     """
     if not value:
         return []
 
-    return [
-        item.strip()
-        for item in str(value).split(", ")
-        if item.strip()
+    text = str(value).strip()
+
+    if not text or text.lower() in {"unknown", "n/a - exchange audit event"}:
+        return []
+
+    parts = [
+        part.strip()
+        for part in text.split(",")
+        if part.strip()
     ]
+
+    # Most Microsoft location strings in this project are:
+    # City, State, Country
+    #
+    # If we have multiple of those chained together, regroup them in threes.
+    if len(parts) > 3 and len(parts) % 3 == 0:
+        locations = []
+
+        for index in range(0, len(parts), 3):
+            locations.append(", ".join(parts[index:index + 3]))
+
+        return locations
+
+    # A single location should stay whole.
+    return [text]
 
 
 def split_ip_list(value):
@@ -958,15 +978,33 @@ def split_ip_list(value):
     Split an IP list while preserving IPv6 addresses.
 
     IPv6 addresses contain colons, so we only split on comma separators.
+
+    This also removes trailing sentence punctuation from alert detail text.
+    Example:
+    - "2605:59ca:...:b78." becomes "2605:59ca:...:b78"
     """
     if not value:
         return []
 
-    return [
-        item.strip()
-        for item in str(value).split(",")
-        if item.strip()
-    ]
+    cleaned_ips = []
+
+    for item in str(value).split(","):
+        cleaned_ip = item.strip()
+
+        # Remove common punctuation that may appear because the IP was pulled
+        # from a human-readable sentence.
+        cleaned_ip = cleaned_ip.strip()
+        cleaned_ip = cleaned_ip.rstrip(".;")
+
+        if not cleaned_ip:
+            continue
+
+        if cleaned_ip.lower() in {"unknown", "n/a"}:
+            continue
+
+        cleaned_ips.append(cleaned_ip)
+
+    return cleaned_ips
 
 
 def normalize_signin_merge_value(value):
