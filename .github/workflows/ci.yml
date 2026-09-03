@@ -14,18 +14,12 @@ jobs:
     name: Validate Python, tests, and Docker build
     runs-on: ubuntu-latest
 
-    env:
-      TENANT_ID: test-tenant-id
-      CLIENT_ID: test-client-id
-      CLIENT_SECRET: test-client-secret
-      TEAMS_WEBHOOK_URL: https://example.invalid/webhook
-
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -43,9 +37,19 @@ jobs:
         run: |
           PYTHONPATH=src pytest -q src/tests
 
+      - name: Create CI env file
+        run: |
+          cat > .env <<'EOF'
+          TENANT_ID=test-tenant-id
+          CLIENT_ID=test-client-id
+          CLIENT_SECRET=test-client-secret
+          TEAMS_WEBHOOK_URL=https://example.invalid/webhook
+          RUN_INTERVAL_SECONDS=900
+          EOF
+
       - name: Validate Docker Compose config
         run: |
-          docker compose config -- quiet
+          docker compose config --quiet
 
       - name: Build Docker image
         run: |
