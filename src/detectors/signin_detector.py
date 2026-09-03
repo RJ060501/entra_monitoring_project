@@ -16,7 +16,9 @@ from core.security_constants import (
     SUSPICIOUS_SIGNIN_TEXT_INDICATORS,
     RISKY_SIGNIN_LEVELS,
 )
-from collections import defaultdict
+from utils.time_utils import format_mountain_time, parse_microsoft_datetime, MOUNTAIN_TIMEZONE
+
+NEW_LOCATION_BURST_MIN_EVENTS = 3
 
 
 def detect_signin_events(events, cached_failed_signins=None):
@@ -37,70 +39,99 @@ def detect_signin_events(events, cached_failed_signins=None):
         events=events,
         cached_failed_signins=cached_failed_signins,
     )
-    alerts = merge_related_signin_alerts(alerts)
 
     return alerts
 
 
 def detect_unusual_login_time(events):
     """
-    Detect sign-ins that happen outside normal business hours.
+    Detect sign-ins that happen during unusual local hours.
 
-    V1 tuning:
+    V2 tuning:
     - Unusual login time by itself is LOW.
     - Unusual login time from a new location is MEDIUM.
     - Unusual login time with suspicious risk/client context is HIGH.
 
-    This keeps the signal available in console/history without spamming Teams
-    for normal after-hours Microsoft 365 activity.
+    Important:
+    This detector uses Mountain Time, not UTC.
+
+    Microsoft sign-in logs are UTC-based, but a UTC hour can be misleading.
+    Example:
+    - 2:00 AM UTC is only 8:00 PM MDT.
     """
     alerts = []
 
     for event in events:
-        user = str(event.get("user", "")).lower().strip()
+        user = normalize_signin_merge_value(event.get("user"))
 
         if not user:
             continue
 
-        # Ignore users that are intentionally suppressed from alerting.
         if user in SUPPRESSED_USERS:
             continue
 
-        # Only alert on successful sign-ins.
         if event.get("status") != "success":
             continue
 
-        hour = event.get("hour")
+        parsed_datetime = parse_event_datetime(event)
 
-        # Treat sign-ins between 1:00 AM and 4:59 AM UTC as unusual.
-        if hour is None or not (1 <= hour <= 4):
+        # If we cannot parse a real timestamp, skip unusual-time detection
+        # instead of falling back to the UTC hour and creating false positives.
+        if not parsed_datetime:
             continue
+
+        local_datetime = parsed_datetime.astimezone(MOUNTAIN_TIMEZONE)
+        local_hour = local_datetime.hour
+        utc_hour = parsed_datetime.hour
+
+        if not is_unusual_local_hour(local_hour):
+            continue
+
+        signin_time = format_event_time(event)
+        signin_location = event.get("location", "Unknown")
+        signin_ip = event.get("ip_address", "Unknown")
+        signin_app = event.get("app_display_name", "Unknown")
 
         has_new_location = bool(event.get("new_location"))
         has_suspicious_context = has_suspicious_signin_context([event])
 
         if has_suspicious_context:
             severity = "high"
-            reason = "unusual login time with suspicious sign-in context"
+            reason = "unusual local login time with suspicious sign-in context"
         elif has_new_location:
             severity = "medium"
-            reason = "unusual login time from a new location"
+            reason = "unusual local login time from a new location"
         else:
             severity = "low"
-            reason = "unusual login time only"
+            reason = "unusual local login time only"
 
         alerts.append({
             "severity": severity,
             "type": "Unusual Login Time",
             "user": user,
             "detail": (
-                f"Login at hour {hour} UTC. "
+                f"Successful sign-in occurred during unusual local hours. "
+                f"Time: {signin_time}. "
+                f"Local login hour: {local_hour} Mountain Time. "
+                f"UTC hour: {utc_hour}. "
                 f"Reason: {reason}. "
-                f"App: {event.get('app_display_name', 'Unknown')}. "
-                f"IP: {event.get('ip_address', 'Unknown')}."
+                f"Location: {signin_location}. "
+                f"IP: {signin_ip}. "
+                f"App: {signin_app}."
             ),
-            "location": event.get("location", "Unknown"),
+            "location": signin_location,
             "source": "Entra Sign-In Logs",
+
+            # Structured fields for alert history and future correlation.
+            "created_datetime": get_event_datetime_value(event),
+            "signin_time_mountain": signin_time,
+            "signin_ip": signin_ip,
+            "signin_app": signin_app,
+            "signin_location": signin_location,
+            "new_location": has_new_location,
+            "local_hour": local_hour,
+            "utc_hour": utc_hour,
+            "severity_reason": reason,
         })
 
     return alerts
@@ -111,21 +142,47 @@ def detect_new_location(events):
     alerts = []
 
     for event in events:
-        user = event["user"]
+        user = normalize_signin_merge_value(event.get("user"))
+
+        if not user:
+            continue
 
         if user in SUPPRESSED_USERS:
             continue
 
+        if event.get("status") != "success":
+            continue
+
+        if not event.get("new_location"):
+            continue
+
+        signin_time = format_event_time(event)
+        signin_location = event.get("location", "Unknown")
+        signin_ip = event.get("ip_address", "Unknown")
+        signin_app = event.get("app_display_name", "Unknown")
+
         # The normalized sign-in event includes a boolean new_location flag.
-        if event.get("new_location"):
-            alerts.append({
-                "severity": "low",
-                "type": "New Location",
-                "user": user,
-                "detail": f"New location detected: {event.get('location', 'Unknown')}",
-                "location": event.get("location", "Unknown"),
-                "source": "Entra Sign-In Logs",
-            })
+        alerts.append({
+            "severity": "low",
+            "type": "New Location",
+            "user": user,
+            "detail": (
+                f"Successful sign-in from a new location. "
+                f"Time: {signin_time}. "
+                f"Location: {signin_location}. "
+                f"IP: {signin_ip}. "
+                f"App: {signin_app}."
+            ),
+            "location": signin_location,
+            "source": "Entra Sign-In Logs",
+
+            # Structured fields for alert history and future correlation.
+            "created_datetime": get_event_datetime_value(event),
+            "signin_time_mountain": signin_time,
+            "signin_ip": signin_ip,
+            "signin_app": signin_app,
+            "signin_location": signin_location,
+        })
 
     return alerts
 
@@ -154,11 +211,10 @@ def detect_failed_then_success(events, cached_failed_signins=None):
     }
 
     combined_events = cached_failed_signins + events
-
     events_by_user = {}
 
     for event in combined_events:
-        user = event.get("user")
+        user = normalize_signin_merge_value(event.get("user"))
 
         if not user:
             continue
@@ -169,7 +225,7 @@ def detect_failed_then_success(events, cached_failed_signins=None):
         events_by_user.setdefault(user, []).append(event)
 
     for user, user_events in events_by_user.items():
-        user_events.sort(key=lambda x: x.get("created_datetime", ""))
+        user_events.sort(key=get_event_sort_value)
 
         failures_before_success = []
 
@@ -193,9 +249,15 @@ def detect_failed_then_success(events, cached_failed_signins=None):
                 continue
 
             failure_count = len(failures_before_success)
-
             latest_failure = failures_before_success[-1]
             
+            first_failure_time = format_event_time(failures_before_success[0])
+            last_failure_time = format_event_time(latest_failure)
+            success_time = format_event_time(event)
+            
+            signin_location = event.get("location", "Unknown")
+            signin_ip = event.get("ip_address", "Unknown")
+            signin_app = event.get("app_display_name", "Unknown")
             success_from_new_location = bool(event.get("new_location"))
 
             # Why:
@@ -220,14 +282,18 @@ def detect_failed_then_success(events, cached_failed_signins=None):
                 "user": user,
                 "detail": (
                     f"{failure_count} failed sign-in(s) followed by success. "
+                    f"First failure: {first_failure_time}. "
+                    f"Last failure: {last_failure_time}. "
+                    f"Successful sign-in: {success_time}. "
                     f"Severity reason: {severity_reason}. "
                     f"Success from new location: {success_from_new_location}. "
-                    f"Successful app: {event.get('app_display_name', 'Unknown')}. "
-                    f"IP: {event.get('ip_address', 'Unknown')}. "
-                    f"Location: {event.get('location', 'Unknown')}. "
-                    f"Last failure reason: {latest_failure.get('failure_reason', 'Unknown')}."
+                    f"Successful app: {signin_app}. "
+                    f"IP: {signin_ip}. "
+                    f"Location: {signin_location}. "
+                    f"Last failure reason: "
+                    f"{latest_failure.get('failure_reason', 'Unknown')}."
                 ),
-                "location": event.get("location", "Unknown"),
+                "location": signin_location,
                 "source": "Entra Sign-In Logs",
                 "cache_clear_user": user,
 
@@ -235,10 +301,16 @@ def detect_failed_then_success(events, cached_failed_signins=None):
                 "failure_count": failure_count,
                 "success_from_new_location": success_from_new_location,
                 "severity_reason": severity_reason,
-                "signin_ip": event.get("ip_address", "Unknown"),
-                "signin_app": event.get("app_display_name", "Unknown"),
-                "signin_location": event.get("location", "Unknown"),
-                "last_failure_reason": latest_failure.get("failure_reason", "Unknown"),
+                "signin_ip": signin_ip,
+                "signin_app": signin_app,
+                "signin_location": signin_location,
+                "first_failure_time_mountain": first_failure_time,
+                "last_failure_time_mountain": last_failure_time,
+                "success_time_mountain": success_time,
+                "last_failure_reason": latest_failure.get(
+                    "failure_reason",
+                    "Unknown",
+                ),
             })
 
             # Reset so multiple successes in the same run do not all alert from
@@ -255,47 +327,17 @@ def detect_new_location_burst(
     """
     Detect repeated successful sign-ins from new locations.
 
-    This detector is context-aware but still intentionally simple.
+    This detector is context-aware but intentionally conservative.
 
-    It does not replace the dedicated detectors for:
-    - failed sign-ins followed by success
-    - mailbox rules
-    - forwarding
-    - hide/delete rules
-    - sign-in/mailbox correlation
+    It includes:
+    - first sign-in time
+    - last sign-in time
+    - observed time window
+    - compact event timeline
 
-    Instead, it uses nearby context to decide whether a new-location burst is
-    just LOW context or should be Teams-visible.
-
-    Severity logic:
-
-    LOW:
-    - 3+ successful new-location sign-ins
-    - same user
-    - same location
-    - same IP
-    - no failed sign-in context
-    - no mailbox activity context
-    - no suspicious client/risk context
-
-    MEDIUM:
-    - same location/IP burst, but high volume
-    - OR same location/IP burst with failed sign-in context
-    - OR same location/IP burst with suspicious client/risk context
-
-    HIGH:
-    - burst from multiple new locations
-    - OR burst from multiple IP addresses
-    - OR burst paired with mailbox activity context
-
-    Why:
-    Microsoft 365 often creates several successful sign-ins close together from
-    normal apps such as Office, SharePoint, Teams, OneDrive, and Outlook.
-    That should not page Teams by itself.
-
-    But when new-location burst activity overlaps with failures, mailbox rule
-    activity, suspicious client behavior, or multiple IPs/locations, it becomes
-    much more useful as a security alert.
+    This makes alerts easier to triage because "two locations" does not always
+    mean simultaneous activity. It may simply mean multiple sign-ins occurred
+    inside the rolling cache window.
     """
     alerts = []
 
@@ -305,7 +347,10 @@ def detect_new_location_burst(
     events_by_user = {}
 
     for event in events:
-        user = event.get("user", "Unknown")
+        user = normalize_signin_merge_value(event.get("user"))
+
+        if not user:
+            continue
 
         if user in SUPPRESSED_USERS:
             continue
@@ -319,44 +364,56 @@ def detect_new_location_burst(
         events_by_user.setdefault(user, []).append(event)
 
     failed_users = {
-        str(event.get("user", "")).lower().strip()
+        normalize_signin_merge_value(event.get("user"))
         for event in failed_signin_events
         if event.get("status") == "failure"
     }
 
     mailbox_context_users = {
-        str(event.get("user", "")).lower().strip()
+        normalize_signin_merge_value(event.get("user"))
         for event in mailbox_events
         if event.get("operation") in MAILBOX_CONFIGURATION_OPERATIONS
     }
 
     for user, user_events in events_by_user.items():
-        if len(user_events) < 3:
+        if len(user_events) < NEW_LOCATION_BURST_MIN_EVENTS:
             continue
 
-        normalized_user = str(user).lower().strip()
+        user_events.sort(key=get_event_sort_value)
 
-        locations = {
+        locations = clean_display_set(
             event.get("location", "Unknown")
             for event in user_events
-        }
+        )
 
-        ip_addresses = {
+        ip_addresses = clean_display_set(
             event.get("ip_address", "Unknown")
             for event in user_events
-        }
+        )
 
-        apps = {
+        apps = clean_display_set(
             event.get("app_display_name", "Unknown")
             for event in user_events
-        }
+        )
 
         event_count = len(user_events)
         location_count = len(locations)
         ip_count = len(ip_addresses)
 
-        has_failed_context = normalized_user in failed_users
-        has_mailbox_context = normalized_user in mailbox_context_users
+        first_event = user_events[0]
+        last_event = user_events[-1]
+
+        first_seen = get_event_datetime_value(first_event)
+        last_seen = get_event_datetime_value(last_event)
+        first_seen_mountain = format_event_time(first_event)
+        last_seen_mountain = format_event_time(last_event)
+        window_minutes = calculate_event_window_minutes(user_events)
+
+        timeline = build_signin_timeline(user_events)
+        timeline_summary = format_timeline_for_alert(timeline)
+
+        has_failed_context = user in failed_users
+        has_mailbox_context = user in mailbox_context_users
         has_suspicious_context = has_suspicious_signin_context(user_events)
 
         multiple_locations = location_count >= 2
@@ -395,16 +452,38 @@ def detect_new_location_burst(
             "type": "New Location Sign-in Burst",
             "user": user,
             "detail": (
-                f"{event_count} successful sign-in(s) from new location activity. "
+                f"{event_count} successful sign-in(s) from new location activity "
+                f"{build_window_sentence_fragment(window_minutes)}. "
                 f"Reason: {reason}. "
+                f"First sign-in: {first_seen_mountain}. "
+                f"Last sign-in: {last_seen_mountain}. "
                 f"Locations: {', '.join(sorted(locations))}. "
                 f"Location count: {location_count}. "
                 f"IP address(es): {', '.join(sorted(ip_addresses))}. "
                 f"IP count: {ip_count}. "
-                f"Apps: {', '.join(sorted(apps))}."
+                f"Apps: {', '.join(sorted(apps))}. "
+                f"Timeline: {timeline_summary}."
             ),
             "location": ", ".join(sorted(locations)),
             "source": "Entra Sign-In Logs",
+
+            # Structured fields for security_alert_history.json and future tuning.
+            "event_count": event_count,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "first_seen_mountain": first_seen_mountain,
+            "last_seen_mountain": last_seen_mountain,
+            "window_minutes": window_minutes,
+            "locations": sorted(locations),
+            "location_count": location_count,
+            "ip_addresses": sorted(ip_addresses),
+            "ip_count": ip_count,
+            "apps": sorted(apps),
+            "timeline": timeline,
+            "severity_reason": reason,
+            "has_failed_context": has_failed_context,
+            "has_mailbox_context": has_mailbox_context,
+            "has_suspicious_context": has_suspicious_context,
         })
 
     return alerts
@@ -539,9 +618,6 @@ def build_related_signin_sequence_alert(user_alerts):
     This keeps standalone new-location bursts intact unless there is another
     related sign-in signal to explain.
     """
-    # Pull out the strongest anchor alert first: the burst is the main event that
-    # provides the most context about the sequence (location, IPs, app mix, volume).
-    # This keeps the final merged alert anchored to the real suspicious pattern.
     burst_alerts = [
         alert for alert in user_alerts
         if alert.get("type") == "New Location Sign-in Burst"
@@ -557,21 +633,14 @@ def build_related_signin_sequence_alert(user_alerts):
         if alert.get("type") == "Unusual Login Time"
     ]
 
-    # A burst alone is not enough to create a consolidated sequence alert.
-    # We only merge when the burst is paired with additional context that makes
-    # the pattern worth summarizing into one higher-level security event.
     if not burst_alerts:
         return None
 
     if not failed_success_alerts and not unusual_time_alerts:
         return None
 
-    # Use the first burst alert as the anchor because it is the most complete
-    # summary of the suspicious activity and the best candidate for correlation.
     best_burst_alert = burst_alerts[0]
 
-    # Build the list of related alerts that are temporally and contextually tied
-    # to this burst, using shared user, location, and/or IP characteristics.
     related_alerts = []
 
     related_alerts.extend(
@@ -588,65 +657,73 @@ def build_related_signin_sequence_alert(user_alerts):
         )
     )
 
-    # If the burst had no valid supporting alerts, do not collapse the event.
-    # The original individual alerts should remain visible instead of being merged.
     if not related_alerts:
         return None
 
-    # Preserve the anchor alert first so the merged summary keeps the most
-    # informative signal at the front, then append only the related evidence.
     merged_alerts = [best_burst_alert] + related_alerts
 
-    # Choose the effective user from the anchor or first related alert, falling
-    # back to "Unknown" if neither provides a value.
     user = best_burst_alert.get("user") or related_alerts[0].get("user") or "Unknown"
-
-    # Summarize the combined evidence across all merged alerts so the final alert
-    # is readable and easier for analysts to audit.
     location = build_sequence_location_summary(merged_alerts)
+    time_summary = build_sequence_time_summary(merged_alerts)
+    timeline_summary = build_sequence_timeline_summary(merged_alerts)
     ip_summary = build_sequence_ip_summary(merged_alerts)
     app_summary = build_sequence_app_summary(merged_alerts)
 
-    # Explain why the merged sequence is suspicious, combining the factors that
-    # contributed to the final alert.
     sequence_reason = build_sequence_reason(
         has_failed_success=bool(failed_success_alerts),
         unusual_time_count=len(unusual_time_alerts),
         has_burst=True,
     )
 
-    # Severity is based on the combined evidence of the sequence rather than any
-    # single detector in isolation.
     severity = get_sequence_severity(merged_alerts)
 
-    # Create a concise but explainable summary for Teams or reporting output.
-    detail = (
-        "Suspicious sign-in sequence detected. "
-        f"Reason: {sequence_reason}. "
-        "Formula: "
-        f"{build_sequence_formula(merged_alerts)}. "
-        f"User: {user}. "
-        f"Locations: {location}. "
-        f"IP address(es): {ip_summary}. "
-        f"Apps: {app_summary}. "
-        "Merged alert evidence: "
-        f"{build_merged_alert_evidence(merged_alerts)}"
+    correlated_alert_types = []
+
+    for alert in merged_alerts:
+        alert_type = alert.get("type")
+
+        if alert_type and alert_type not in correlated_alert_types:
+            correlated_alert_types.append(alert_type)
+
+    detail_parts = [
+        "Suspicious sign-in sequence detected.",
+        f"Reason: {sequence_reason}.",
+        f"Formula: {build_sequence_formula(merged_alerts)}.",
+    ]
+
+    if time_summary:
+        detail_parts.append(time_summary)
+
+    detail_parts.extend([
+        f"User: {user}.",
+        f"Locations: {location}.",
+        f"IP address(es): {ip_summary}.",
+        f"Apps: {app_summary}.",
+    ])
+
+    if timeline_summary:
+        detail_parts.append(f"Timeline: {timeline_summary}.")
+
+    detail_parts.append(
+        f"Merged signals: {', '.join(correlated_alert_types)}."
     )
 
-    # Return a single consolidated alert object that preserves the original
-    # evidence list and the full set of correlated alert types.
+    detail_parts.append(
+        "Full merged evidence is retained in alert history."
+    )
+
     return {
         "type": "Suspicious Sign-in Sequence",
         "severity": severity,
         "user": user,
         "location": location,
         "source": "Entra Sign-In Logs",
-        "detail": detail,
+        "detail": " ".join(detail_parts),
         "ip_address": ip_summary,
         "merged_alerts": merged_alerts,
-        "correlated_alert_types": [
-            alert.get("type") for alert in merged_alerts
-        ],
+        "merged_evidence": build_merged_alert_evidence(merged_alerts),
+        "correlated_alert_types": correlated_alert_types,
+        "timeline": get_first_available_timeline(merged_alerts),
     }
 
 
@@ -819,36 +896,63 @@ def build_sequence_app_summary(alerts):
     apps = set()
 
     for alert in alerts:
-        detail = str(alert.get("detail", ""))
-
-        if "App:" in detail:
-            after_marker = detail.split("App:", 1)[1].strip()
-            app_text = after_marker.split(".")[0].strip()
-
-            if app_text:
-                apps.add(app_text)
-
-            for app in app_text.split(","):
-                cleaned_app = app.strip()
-                if cleaned_app:
-                    apps.add(cleaned_app)
-
-        if "Successful app:" in detail:
-            after_marker = detail.split("Successful app:", 1)[1].strip()
-            app_text = after_marker.split(".")[0].strip()
-
-            if app_text:
-                apps.add(app_text)
-
-        app_display_name = alert.get("app_display_name")
-        if app_display_name:
-            apps.add(str(app_display_name).strip())
+        apps.update(extract_apps_from_alert(alert))
 
     if not apps:
         return "Unknown"
 
     return ", ".join(sorted(apps))
 
+def build_sequence_time_summary(alerts):
+    """
+    Build a short time summary for a merged sequence alert.
+
+    Prefer the structured fields from the New Location Sign-in Burst alert.
+    """
+    for alert in alerts:
+        if alert.get("type") != "New Location Sign-in Burst":
+            continue
+
+        first_seen = alert.get("first_seen_mountain")
+        last_seen = alert.get("last_seen_mountain")
+        window_minutes = alert.get("window_minutes")
+
+        if first_seen and last_seen:
+            return (
+                f"First sign-in: {first_seen}. "
+                f"Last sign-in: {last_seen}. "
+                f"Window: {format_window_minutes(window_minutes)}."
+            )
+
+    return ""
+
+def build_sequence_timeline_summary(alerts):
+    """
+    Reuse the timeline from the burst alert when available.
+    """
+    timeline = get_first_available_timeline(alerts)
+
+    if not timeline:
+        return ""
+
+    return format_timeline_for_alert(timeline)
+
+
+def get_first_available_timeline(alerts):
+    """
+    Return the first structured timeline found in a list of alerts.
+    """
+    for alert in alerts:
+        timeline = alert.get("timeline")
+
+        if timeline:
+            return timeline
+
+    return []
+
+# ---------------------------------------------------------------------------
+# Alert field extraction helpers
+# ---------------------------------------------------------------------------
 
 def extract_locations_from_alert(alert):
     """
@@ -856,6 +960,7 @@ def extract_locations_from_alert(alert):
 
     Supports:
     - alert["location"]
+    - alert["locations"]
     - "Locations: location1, location2."
     - "Location: location."
     """
@@ -863,24 +968,42 @@ def extract_locations_from_alert(alert):
 
     location_value = alert.get("location")
     if location_value:
-        for location in split_location_list(location_value):
-            locations.add(location)
+        locations.update(split_location_list(location_value))
+
+    structured_locations = alert.get("locations")
+    if isinstance(structured_locations, list):
+        locations.update(structured_locations)
 
     detail = str(alert.get("detail", ""))
 
-    if "Locations:" in detail:
-        after_marker = detail.split("Locations:", 1)[1].strip()
-        location_text = after_marker.split(".")[0].strip()
+    locations_text = extract_detail_value(
+        text=detail,
+        start_marker="Locations:",
+        end_markers=[
+            "Location count:",
+            "IP address(es):",
+            "IP:",
+            "Apps:",
+            "Timeline:",
+        ],
+    )
 
-        for location in split_location_list(location_text):
-            locations.add(location)
+    if locations_text:
+        locations.update(split_location_list(locations_text))
 
-    elif "Location:" in detail:
-        after_marker = detail.split("Location:", 1)[1].strip()
-        location_text = after_marker.split(".")[0].strip()
+    location_text = extract_detail_value(
+        text=detail,
+        start_marker="Location:",
+        end_markers=[
+            "IP:",
+            "App:",
+            "Last failure reason:",
+            "Timeline:",
+        ],
+    )
 
-        for location in split_location_list(location_text):
-            locations.add(location)
+    if location_text:
+        locations.update(split_location_list(location_text))
 
     return {
         normalize_display_value(location)
@@ -895,40 +1018,347 @@ def extract_ips_from_alert(alert):
 
     Supports:
     - alert["ip_address"]
+    - alert["ip_addresses"]
+    - alert["signin_ip"]
     - "IP: x.x.x.x"
     - "IP address(es): x.x.x.x, y.y.y.y"
     """
     ips = set()
 
-    ip_value = alert.get("ip_address")
-    if ip_value:
-        for ip in split_ip_list(ip_value):
-            ips.add(ip)
+    for field_name in ["ip_address", "signin_ip"]:
+        ip_value = alert.get(field_name)
+
+        if ip_value:
+            ips.update(split_ip_list(ip_value))
+
+    structured_ips = alert.get("ip_addresses")
+    if isinstance(structured_ips, list):
+        ips.update(structured_ips)
 
     detail = str(alert.get("detail", ""))
 
-    if "IP address(es):" in detail:
-        after_marker = detail.split("IP address(es):", 1)[1].strip()
-        ip_text = after_marker.split(". ")[0].strip()
-        ip_text = ip_text.split(" Apps:")[0].strip()
+    ip_list_text = extract_detail_value(
+        text=detail,
+        start_marker="IP address(es):",
+        end_markers=[
+            "IP count:",
+            "Apps:",
+            "Timeline:",
+            "Merged alert evidence:",
+        ],
+    )
 
-        for ip in split_ip_list(ip_text):
-            ips.add(ip)
+    if ip_list_text:
+        ips.update(split_ip_list(ip_list_text))
 
-    elif "IP:" in detail:
-        after_marker = detail.split("IP:", 1)[1].strip()
-        ip_text = after_marker.split(". ")[0].strip()
-        ip_text = ip_text.split(" Location:")[0].strip()
-        ip_text = ip_text.split(" Apps:")[0].strip()
+    ip_text = extract_detail_value(
+        text=detail,
+        start_marker="IP:",
+        end_markers=[
+            "Location:",
+            "App:",
+            "Apps:",
+            "Last failure reason:",
+            "Timeline:",
+        ],
+    )
 
-        for ip in split_ip_list(ip_text):
-            ips.add(ip)
+    if ip_text:
+        ips.update(split_ip_list(ip_text))
 
     return {
         normalize_display_value(ip)
         for ip in ips
         if normalize_display_value(ip)
     }
+
+
+def extract_apps_from_alert(alert):
+    """
+    Extract app names from structured fields and alert detail text.
+
+    Supports:
+    - alert["signin_app"]
+    - alert["app_display_name"]
+    - alert["apps"]
+    - "App: ..."
+    - "Successful app: ..."
+    - "Apps: ..."
+    """
+    apps = set()
+
+    for field_name in ["signin_app", "app_display_name"]:
+        app_value = alert.get(field_name)
+
+        if app_value:
+            apps.add(str(app_value).strip())
+
+    structured_apps = alert.get("apps")
+    if isinstance(structured_apps, list):
+        apps.update(structured_apps)
+
+    detail = str(alert.get("detail", ""))
+
+    markers = [
+        ("Successful app:", ["IP:", "Location:", "Timeline:"]),
+        ("Apps:", ["Timeline:", "Merged alert evidence:"]),
+        ("App:", ["IP:", "Location:", "Timeline:"]),
+    ]
+
+    for start_marker, end_markers in markers:
+        app_text = extract_detail_value(
+            text=detail,
+            start_marker=start_marker,
+            end_markers=end_markers,
+        )
+
+        if app_text:
+            for app in split_app_list(app_text):
+                apps.add(app)
+
+    return {
+        normalize_display_value(app)
+        for app in apps
+        if normalize_display_value(app)
+        and normalize_display_value(app).lower() != "unknown"
+    }
+
+
+def extract_detail_value(text, start_marker, end_markers):
+    """
+    Extract a value from human-readable alert detail text.
+
+    Example:
+        text:
+            "Locations: Atlanta, Georgia, US. Location count: 1."
+
+        start_marker:
+            "Locations:"
+
+        end_markers:
+            ["Location count:"]
+
+        result:
+            "Atlanta, Georgia, US"
+
+    This avoids fragile parsing where a period inside an IPv4 address causes
+    the value to be split incorrectly.
+    """
+    if not text or start_marker not in text:
+        return ""
+
+    value = text.split(start_marker, 1)[1].strip()
+
+    marker_positions = [
+        value.find(marker)
+        for marker in end_markers
+        if marker in value
+    ]
+
+    if marker_positions:
+        value = value[:min(marker_positions)]
+
+    return value.strip().strip(".; ")
+
+
+# ---------------------------------------------------------------------------
+# Time and timeline helpers
+# ---------------------------------------------------------------------------
+
+def get_event_datetime_value(event):
+    """
+    Return the best available timestamp string from a normalized sign-in event.
+    """
+    return (
+        event.get("created_datetime")
+        or event.get("createdDateTime")
+        or event.get("activityDateTime")
+        or event.get("time")
+        or event.get("timestamp")
+    )
+
+
+def parse_event_datetime(event):
+    """
+    Parse the best available timestamp from an event.
+    """
+    value = get_event_datetime_value(event)
+
+    if not value:
+        return None
+
+    return parse_microsoft_datetime(value)
+
+
+def format_event_time(event):
+    """
+    Format an event timestamp in Mountain Time for readable alerts.
+    """
+    value = get_event_datetime_value(event)
+
+    if not value:
+        return "Unknown"
+
+    return format_mountain_time(value)
+
+
+def get_event_sort_value(event):
+    """
+    Sort events chronologically using their parsed timestamp.
+
+    Events without a usable timestamp sort first. That is acceptable here
+    because the alert timeline will still show "Unknown" for those entries.
+    """
+    parsed_datetime = parse_event_datetime(event)
+
+    if not parsed_datetime:
+        return 0
+
+    return parsed_datetime.timestamp()
+
+
+def calculate_event_window_minutes(events):
+    """
+    Calculate the number of minutes between the first and last parsed event
+    timestamps.
+    """
+    parsed_datetimes = [
+        parse_event_datetime(event)
+        for event in events
+    ]
+
+    parsed_datetimes = [
+        parsed_datetime
+        for parsed_datetime in parsed_datetimes
+        if parsed_datetime
+    ]
+
+    if len(parsed_datetimes) < 2:
+        return None
+
+    first_seen = min(parsed_datetimes)
+    last_seen = max(parsed_datetimes)
+
+    seconds = max(
+        0,
+        int((last_seen - first_seen).total_seconds()),
+    )
+
+    return seconds // 60
+
+
+def format_window_minutes(window_minutes):
+    """
+    Format a time window for human-readable alert text.
+    """
+    if window_minutes is None:
+        return "unknown"
+
+    if window_minutes <= 0:
+        return "less than 1 minute"
+
+    if window_minutes == 1:
+        return "1 minute"
+
+    return f"{window_minutes} minutes"
+
+
+def build_window_sentence_fragment(window_minutes):
+    """
+    Build the time-window phrase used in burst alert summaries.
+    """
+    if window_minutes is None:
+        return "inside the current cache window"
+
+    return f"within {format_window_minutes(window_minutes)}"
+
+
+def build_signin_timeline(events, max_items=8):
+    """
+    Build a compact structured timeline from sign-in events.
+
+    The timeline is stored in alert history and also rendered into Teams detail
+    text. Limiting the count prevents very large Teams messages during noisy
+    sign-in bursts.
+    """
+    sorted_events = sorted(events, key=get_event_sort_value)
+
+    timeline = []
+
+    for event in sorted_events[:max_items]:
+        timeline.append({
+            "time": format_event_time(event),
+            "location": event.get("location", "Unknown"),
+            "ip_address": event.get("ip_address", "Unknown"),
+            "app": event.get("app_display_name", "Unknown"),
+            "status": event.get("status", "Unknown"),
+        })
+
+    if len(sorted_events) > max_items:
+        timeline.append({
+            "time": "Additional events omitted",
+            "location": f"{len(sorted_events) - max_items} more event(s)",
+            "ip_address": "",
+            "app": "",
+            "status": "",
+        })
+
+    return timeline
+
+
+def format_timeline_for_alert(timeline):
+    """
+    Convert a structured timeline into compact text for Teams/detail output.
+    """
+    if not timeline:
+        return "Unknown"
+
+    timeline_parts = []
+
+    for index, item in enumerate(timeline, start=1):
+        time_value = item.get("time", "Unknown")
+        location = item.get("location", "Unknown")
+        ip_address = item.get("ip_address", "Unknown")
+        app = item.get("app", "Unknown")
+
+        if time_value == "Additional events omitted":
+            timeline_parts.append(
+                f"{index}) {location}"
+            )
+            continue
+
+        timeline_parts.append(
+            f"{index}) {time_value} | {location} | {ip_address} | {app}"
+        )
+
+    return "; ".join(timeline_parts)
+
+
+# ---------------------------------------------------------------------------
+# Value normalization helpers
+# ---------------------------------------------------------------------------
+
+def clean_display_set(values):
+    """
+    Normalize a collection of display values while removing empty values.
+    """
+    cleaned_values = set()
+
+    for value in values:
+        cleaned_value = normalize_display_value(value)
+
+        if not cleaned_value:
+            continue
+
+        if cleaned_value.lower() in {"unknown", "n/a"}:
+            continue
+
+        cleaned_values.add(cleaned_value)
+
+    if not cleaned_values:
+        return {"Unknown"}
+
+    return cleaned_values
 
 
 def split_location_list(value):
@@ -946,7 +1376,7 @@ def split_location_list(value):
     if not value:
         return []
 
-    text = str(value).strip()
+    text = str(value).strip().strip(".;")
 
     if not text or text.lower() in {"unknown", "n/a - exchange audit event"}:
         return []
@@ -969,7 +1399,6 @@ def split_location_list(value):
 
         return locations
 
-    # A single location should stay whole.
     return [text]
 
 
@@ -980,8 +1409,6 @@ def split_ip_list(value):
     IPv6 addresses contain colons, so we only split on comma separators.
 
     This also removes trailing sentence punctuation from alert detail text.
-    Example:
-    - "2605:59ca:...:b78." becomes "2605:59ca:...:b78"
     """
     if not value:
         return []
@@ -989,12 +1416,7 @@ def split_ip_list(value):
     cleaned_ips = []
 
     for item in str(value).split(","):
-        cleaned_ip = item.strip()
-
-        # Remove common punctuation that may appear because the IP was pulled
-        # from a human-readable sentence.
-        cleaned_ip = cleaned_ip.strip()
-        cleaned_ip = cleaned_ip.rstrip(".;")
+        cleaned_ip = item.strip().rstrip(".;")
 
         if not cleaned_ip:
             continue
@@ -1005,6 +1427,29 @@ def split_ip_list(value):
         cleaned_ips.append(cleaned_ip)
 
     return cleaned_ips
+
+
+def split_app_list(value):
+    """
+    Split an app list from alert detail text.
+    """
+    if not value:
+        return []
+
+    apps = []
+
+    for item in str(value).split(","):
+        cleaned_app = item.strip().rstrip(".;")
+
+        if not cleaned_app:
+            continue
+
+        if cleaned_app.lower() in {"unknown", "n/a"}:
+            continue
+
+        apps.append(cleaned_app)
+
+    return apps
 
 
 def normalize_signin_merge_value(value):
@@ -1027,3 +1472,20 @@ def normalize_display_value(value):
         return ""
 
     return str(value).strip()
+    
+def is_unusual_local_hour(local_hour):
+    """
+    Return True when a sign-in happened during a locally unusual hour.
+
+    We use Mountain Time because the company operates primarily from Mountain
+    Time locations.
+
+    Current rule:
+    - 11:00 PM through 5:59 AM Mountain Time is unusual.
+
+    This avoids false positives where 2:00 AM UTC is actually only 8:00 PM MDT.
+    """
+    if local_hour is None:
+        return False
+
+    return local_hour >= 23 or local_hour <= 5

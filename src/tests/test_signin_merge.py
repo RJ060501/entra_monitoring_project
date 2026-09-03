@@ -94,8 +94,18 @@ def assert_sequence_count(input_alerts, expected_count):
 
     for sequence_alert in sequence_alerts:
         detail = sequence_alert.get("detail", "")
+
+        # The Teams/detail text should keep the short analyst-friendly summary.
         assert "Formula:" in detail
-        assert "Merged alert evidence:" in detail
+        assert "Merged signals:" in detail
+        assert "Full merged evidence is retained in alert history." in detail
+
+        # The full original evidence should still be preserved structurally.
+        assert sequence_alert.get("merged_alerts")
+        assert sequence_alert.get("merged_evidence")
+
+        merged_evidence = sequence_alert.get("merged_evidence", "")
+        assert "New Location Sign-in Burst" in merged_evidence
 
     return result
 
