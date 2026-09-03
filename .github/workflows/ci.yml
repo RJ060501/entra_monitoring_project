@@ -9,7 +9,6 @@ on:
 permissions:
   contents: read
 
-  
 jobs:
   validate:
     name: Validate Python, tests, and Docker build
