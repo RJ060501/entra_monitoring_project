@@ -1275,29 +1275,70 @@ def build_window_sentence_fragment(window_minutes):
 
 def build_signin_timeline(events, max_items=8):
     """
-    Build a compact structured timeline from sign-in events.
+    Build a compact grouped timeline from sign-in events.
 
-    The timeline is stored in alert history and also rendered into Teams detail
-    text. Limiting the count prevents very large Teams messages during noisy
-    sign-in bursts.
+    Instead of listing every nearly identical Microsoft sign-in event, group
+    repeated events by:
+
+    - location
+    - IP address
+    - application
+    - status
+
+    This keeps Teams alerts readable when Microsoft logs several token/app
+    sign-in records within a few seconds.
     """
     sorted_events = sorted(events, key=get_event_sort_value)
 
+    grouped_events = {}
+
+    for event in sorted_events:
+        group_key = (
+            event.get("location", "Unknown"),
+            event.get("ip_address", "Unknown"),
+            event.get("app_display_name", "Unknown"),
+            event.get("status", "Unknown"),
+        )
+
+        if group_key not in grouped_events:
+            grouped_events[group_key] = {
+                "events": [],
+                "location": event.get("location", "Unknown"),
+                "ip_address": event.get("ip_address", "Unknown"),
+                "app": event.get("app_display_name", "Unknown"),
+                "status": event.get("status", "Unknown"),
+            }
+
+        grouped_events[group_key]["events"].append(event)
+
     timeline = []
 
-    for event in sorted_events[:max_items]:
+    for group in grouped_events.values():
+        group_events = sorted(group["events"], key=get_event_sort_value)
+
+        first_event = group_events[0]
+        last_event = group_events[-1]
+
         timeline.append({
-            "time": format_event_time(event),
-            "location": event.get("location", "Unknown"),
-            "ip_address": event.get("ip_address", "Unknown"),
-            "app": event.get("app_display_name", "Unknown"),
-            "status": event.get("status", "Unknown"),
+            "count": len(group_events),
+            "first_time": format_event_time(first_event),
+            "last_time": format_event_time(last_event),
+            "location": group["location"],
+            "ip_address": group["ip_address"],
+            "app": group["app"],
+            "status": group["status"],
         })
 
-    if len(sorted_events) > max_items:
+    timeline.sort(key=lambda item: item.get("first_time", ""))
+
+    if len(timeline) > max_items:
+        omitted_count = len(timeline) - max_items
+        timeline = timeline[:max_items]
         timeline.append({
-            "time": "Additional events omitted",
-            "location": f"{len(sorted_events) - max_items} more event(s)",
+            "count": omitted_count,
+            "first_time": "Additional groups omitted",
+            "last_time": "",
+            "location": f"{omitted_count} more grouped timeline item(s)",
             "ip_address": "",
             "app": "",
             "status": "",
@@ -1308,7 +1349,8 @@ def build_signin_timeline(events, max_items=8):
 
 def format_timeline_for_alert(timeline):
     """
-    Convert a structured timeline into compact text for Teams/detail output.
+    Convert a structured grouped timeline into compact text for Teams/detail
+    output.
     """
     if not timeline:
         return "Unknown"
@@ -1316,23 +1358,31 @@ def format_timeline_for_alert(timeline):
     timeline_parts = []
 
     for index, item in enumerate(timeline, start=1):
-        time_value = item.get("time", "Unknown")
+        first_time = item.get("first_time", "Unknown")
+        last_time = item.get("last_time", "Unknown")
+        count = item.get("count", 1)
         location = item.get("location", "Unknown")
         ip_address = item.get("ip_address", "Unknown")
         app = item.get("app", "Unknown")
 
-        if time_value == "Additional events omitted":
+        if first_time == "Additional groups omitted":
             timeline_parts.append(
                 f"{index}) {location}"
             )
             continue
 
-        timeline_parts.append(
-            f"{index}) {time_value} | {location} | {ip_address} | {app}"
-        )
+        if count == 1:
+            timeline_parts.append(
+                f"{index}) 1 sign-in | {first_time} | "
+                f"{location} | {ip_address} | {app}"
+            )
+        else:
+            timeline_parts.append(
+                f"{index}) {count} sign-ins | {first_time} → {last_time} | "
+                f"{location} | {ip_address} | {app}"
+            )
 
     return "; ".join(timeline_parts)
-
 
 # ---------------------------------------------------------------------------
 # Value normalization helpers
