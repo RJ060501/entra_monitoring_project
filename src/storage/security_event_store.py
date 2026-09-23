@@ -233,3 +233,293 @@ def clean_string(value):
     
     return cleaned_value
 
+def extract_source_event_id(event):
+    """
+    Extract the best available source event ID.
+
+    Different systems use different names:
+    - Microsoft Graph sign-ins commonly use id
+    - M365 audit logs may use Id, RecordId, or other fields depending on parser
+    """
+    return clean_string(
+        get_first_value(
+            event,
+            [
+                "id",
+                "Id",
+                "event_id",
+                "record_id",
+                "RecordId",
+                "source_event_id",
+                "audit_id",
+            ],
+        )
+    )
+
+def extract_event_time(event):
+    """
+    Extract the best available event timestamp.
+
+    This field is named event_time_utc, but this function stores the original
+    timestamp string for now. Most Microsoft timestamps are already UTC ISO
+    strings. Later we can add strict UTC normalization if needed.
+    """
+    return clean_string(
+        get_first_value(
+            event,
+            [
+                "created_datetime",
+                "createdDateTime",
+                "activityDateTime",
+                "CreationTime",
+                "creation_time",
+                "event_time",
+                "time",
+                "timestamp",
+            ],
+        )
+    )
+
+
+def extract_event_user(event):
+    """
+    Extract the best available user identity from a source event.
+    """
+    return clean_string(
+        get_first_value(
+            event,
+            [
+                "user",
+                "userPrincipalName",
+                "UserId",
+                "user_id",
+                "mailbox_owner",
+                "actor",
+                "target_user",
+            ],
+        )
+    )
+
+
+def extract_event_ip(event):
+    """
+    Extract the best available IP address from a source event.
+    """
+    return clean_string(
+        get_first_value(
+            event,
+            [
+                "ip_address",
+                "ipAddress",
+                "ClientIP",
+                "client_ip",
+                "source_ip",
+                "IPAddress",
+            ],
+        )
+    )
+
+
+def extract_event_location(event):
+    """
+    Extract the best available location from a source event.
+    """
+    return clean_string(
+        get_first_value(
+            event,
+            [
+                "location",
+                "signin_location",
+                "Location",
+                "city_state_country",
+            ],
+        )
+    )
+
+
+def extract_event_app(event):
+    """
+    Extract the best available application/client name from a source event.
+    """
+    return clean_string(
+        get_first_value(
+            event,
+            [
+                "app_display_name",
+                "appDisplayName",
+                "Application",
+                "application",
+                "client_app",
+                "workload",
+            ],
+        )
+    )
+
+
+def extract_event_operation(event):
+    """
+    Extract the best available operation/action from a source event.
+    """
+    return clean_string(
+        get_first_value(
+            event,
+            [
+                "operation",
+                "Operation",
+                "activityDisplayName",
+                "activity",
+                "action",
+                "event_name",
+            ],
+        )
+    )
+
+
+def extract_event_status(event):
+    """
+    Extract the best available event status.
+    """
+    return clean_string(
+        get_first_value(
+            event,
+            [
+                "status",
+                "result",
+                "ResultStatus",
+                "outcome",
+            ],
+        )
+    )
+    
+def build_event_summary(event):
+    """
+    Build a short source-agnostic summary for quick CLI/dashboard display.
+    """
+    operation = extract_event_operation(event)
+    app = extract_event_app(event)
+    status = extract_event_status(event)
+    location = extract_event_location(event)
+
+    parts = []
+
+    if operation:
+        parts.append(f"operation={operation}")
+
+    if app:
+        parts.append(f"app={app}")
+
+    if status:
+        parts.append(f"status={status}")
+
+    if location:
+        parts.append(f"location={location}")
+
+    if not parts:
+        return "No summary fields available"
+
+    return "; ".join(parts)
+
+def build_source_event_hash(event, source, event_type):
+    """
+    Build a stable hash for source event deduplication.
+
+    If the source provides a real event ID, use that. Otherwise use the full
+    event JSON as the fallback.
+    
+    Hash used to tell whether we've seen this event before.
+    """
+    source_event_id = extract_source_event_id(event)
+
+    if source_event_id:
+        hash_payload = {
+            "source": source,
+            "event_type": event_type,
+            "source_event_id": source_event_id,
+        }
+    else:
+        hash_payload = {
+            "source": source,
+            "event_type": event_type,
+            "event": event,
+        }
+
+    return hashlib.sha256(
+        json_dumps(hash_payload).encode("utf-8")
+    ).hexdigest()
+
+def insert_source_event(
+    event,
+    source,
+    event_type,
+    database_path=None,
+):
+    """
+    Insert one source event into SQLite.
+
+    Returns:
+        The source_events.id value for the inserted or existing event.
+    """
+    initialize_database(database_path)
+
+    event_hash = build_source_event_hash(
+        event=event,
+        source=source,
+        event_type=event_type,
+    )
+
+    source_event_id = extract_source_event_id(event)
+    collected_at_utc = get_utc_now_iso()
+    raw_json = json_dumps(event)
+
+    with connect_database(database_path) as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO source_events (
+                event_hash,
+                source,
+                event_type,
+                source_event_id,
+                event_time_utc,
+                collected_at_utc,
+                user,
+                ip_address,
+                location,
+                app,
+                operation,
+                status,
+                summary,
+                raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_hash,
+                source,
+                event_type,
+                source_event_id,
+                extract_event_time(event),
+                collected_at_utc,
+                extract_event_user(event),
+                extract_event_ip(event),
+                extract_event_location(event),
+                extract_event_app(event),
+                extract_event_operation(event),
+                extract_event_status(event),
+                build_event_summary(event),
+                raw_json,
+            ),
+        )
+
+        row = connection.execute(
+            """
+            SELECT id
+            FROM source_events
+            WHERE event_hash = ?
+            """,
+            (event_hash,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return row["id"]
