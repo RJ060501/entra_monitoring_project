@@ -523,3 +523,35 @@ def insert_source_event(
         return None
 
     return row["id"]
+
+def insert_source_events(
+    events,
+    source,
+    event_type,
+    database_path=None,
+):
+    """
+    Insert multiple source events.
+
+    Returns:
+        Dictionary with attempted count and event IDs.
+    """
+    events = events or []
+    event_ids = []
+
+    for event in events:
+        event_id = insert_source_event(
+            event=event,
+            source=source,
+            event_type=event_type,
+            database_path=database_path,
+        )
+
+        if event_id:
+            event_ids.append(event_id)
+
+    return {
+        "attempted": len(events),
+        "event_ids": event_ids,
+    }
+    
