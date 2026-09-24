@@ -27,7 +27,7 @@ from pathlib import Path
 
 DEFAULT_DATABASE_PATH = "state/security_events.db"
 
-def get_database_path(database_path=none):
+def get_database_path(database_path=None):
     """
     Resolve the database path.
 
@@ -555,3 +555,281 @@ def insert_source_events(
         "event_ids": event_ids,
     }
     
+def build_alert_hash(alert, delivery_status):
+    """
+    Build a stable hash for alert deduplication.
+
+    delivery_status is included so the same logical alert can exist in the
+    database as active and suppressed if that becomes useful later.
+    """
+    hash_payload = {
+        "delivery_status": delivery_status,
+        "type": alert.get("type"),
+        "severity": alert.get("severity"),
+        "user": alert.get("user"),
+        "source": alert.get("source"),
+        "location": alert.get("location"),
+        "detail": alert.get("detail"),
+    }
+
+    return hashlib.sha256(
+        json_dumps(hash_payload).encode("utf-8")
+    ).hexdigest()
+
+def insert_alert(
+    alert,
+    delivery_status,
+    database_path=None,
+):
+    """
+    Insert one generated alert into SQLite.
+
+    delivery_status examples:
+    - active: alert survived suppression and is eligible for notification/history
+    - suppressed: alert was detected but suppressed as a repeat
+    - test: test alert or manually inserted sample
+    """
+    initialize_database(database_path)
+
+    alert_hash = build_alert_hash(
+        alert=alert,
+        delivery_status=delivery_status,
+    )
+
+    stored_at_utc = get_utc_now_iso()
+    alert_json = json_dumps(alert)
+
+    with connect_database(database_path) as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO alerts (
+                alert_hash,
+                created_at_utc,
+                stored_at_utc,
+                delivery_status,
+                severity,
+                alert_type,
+                user,
+                source,
+                location,
+                ip_address,
+                detail,
+                alert_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                alert_hash,
+                get_alert_created_at(alert),
+                stored_at_utc,
+                delivery_status,
+                alert.get("severity"),
+                alert.get("type"),
+                alert.get("user"),
+                alert.get("source"),
+                alert.get("location"),
+                alert.get("ip_address") or alert.get("signin_ip"),
+                alert.get("detail"),
+                alert_json,
+            ),
+        )
+
+        row = connection.execute(
+            """
+            SELECT id
+            FROM alerts
+            WHERE alert_hash = ?
+            """,
+            (alert_hash,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return row["id"]
+
+def insert_alerts(
+    alerts,
+    delivery_status,
+    database_path=None,
+):
+    """
+    Insert multiple alerts.
+
+    Returns:
+        Dictionary with attempted count and alert IDs.
+    """
+    alerts = alerts or []
+    alert_ids = []
+
+    for alert in alerts:
+        alert_id = insert_alert(
+            alert=alert,
+            delivery_status=delivery_status,
+            database_path=database_path,
+        )
+
+        if alert_id:
+            alert_ids.append(alert_id)
+
+    return {
+        "attempted": len(alerts),
+        "alert_ids": alert_ids,
+    }
+
+def get_recent_alerts(limit=20, database_path=None):
+    """
+    Return recent alerts for debugging, CLI reports, dashboards, and AI tools.
+    """
+    initialize_database(database_path)
+
+    with connect_database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                created_at_utc,
+                stored_at_utc,
+                delivery_status,
+                severity,
+                alert_type,
+                user,
+                source,
+                location,
+                ip_address,
+                detail
+            FROM alerts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_recent_source_events(limit=20, database_path=None):
+    """
+    Return recent source events for debugging, dashboards, and AI tools.
+    """
+    initialize_database(database_path)
+
+    with connect_database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                source,
+                event_type,
+                source_event_id,
+                event_time_utc,
+                collected_at_utc,
+                user,
+                ip_address,
+                location,
+                app,
+                operation,
+                status,
+                summary
+            FROM source_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_source_events_for_user(
+    user,
+    limit=50,
+    database_path=None,
+):
+    """
+    Return recent source events for one user.
+
+    This will be useful later for agentic AI triage.
+    """
+    initialize_database(database_path)
+
+    normalized_user = clean_string(user)
+
+    with connect_database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                source,
+                event_type,
+                source_event_id,
+                event_time_utc,
+                collected_at_utc,
+                user,
+                ip_address,
+                location,
+                app,
+                operation,
+                status,
+                summary
+            FROM source_events
+            WHERE lower(user) = lower(?)
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (normalized_user, limit),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+def get_first_value(mapping, keys):
+    """
+    Return the first non-empty value found in a dictionary.
+
+    Why this exists:
+    Different source systems use different field names for similar concepts.
+
+    Example:
+    - Microsoft Graph sign-ins may use "id"
+    - M365 audit events may use "Id" or "RecordId"
+    - Future sources may use "event_id" or "source_event_id"
+
+    This function is a defensive fallback for source-agnostic storage.
+    Long-term, source-specific collectors should normalize events before they
+    reach this SQLite layer.
+    """
+    for key in keys:
+        value = mapping.get(key)
+
+        if value is not None and str(value).strip():
+            return value
+
+    return None
+
+def get_alert_created_at(alert):
+    """
+    Find the best available alert timestamp.
+
+    This value is used for the alerts.created_at_utc column.
+
+    We prefer source/event timestamps when available. If the alert does not
+    include one, we fall back to the current UTC time so the alert can still be
+    stored safely.
+    """
+    created_at = get_first_value(
+        alert,
+        [
+            "created_at_utc",
+            "created_datetime",
+            "createdDateTime",
+            "activityDateTime",
+            "first_seen",
+            "last_seen",
+            "timestamp",
+        ],
+    )
+
+    if created_at:
+        return str(created_at)
+
+    return get_utc_now_iso()
